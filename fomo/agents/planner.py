@@ -43,11 +43,36 @@ class Planner:
             raise PlanningError("planner cannot plan with an empty agent registry")
         capabilities = self.agents.capabilities
         descriptions = [
-            f"{name}: {capabilities[name].role} — {capabilities[name].capability}"
+            f"{name}: {capabilities[name].role} — {capabilities[name].capability} "
+            f"Enabled tools: {', '.join(capabilities[name].enabled_tools) or 'none'}."
             for name in self.agents.names
             if name in capabilities
         ]
         names = ", ".join(self.agents.names)
+        research = capabilities.get("research")
+        coding = capabilities.get("coding")
+        tool_policy = (
+            "Plan optional tools only for agents whose registered enabled_tools include "
+            "that tool, and only with explicit caller authorization. Do not invent access "
+            "to files, databases, or other integrations. "
+        )
+        if "research" in self.agents.names:
+            tool_policy += (
+                "The research agent may use caller-supplied sources and fetch explicitly "
+                "approved web URLs when the caller requests browsing. Do not plan "
+                "unrestricted web search. "
+                if research and "web_browsing" in research.enabled_tools
+                else "Research may use only caller-supplied sources. Do not plan "
+                "external web research. "
+            )
+        if "coding" in self.agents.names:
+            tool_policy += (
+                "The coding agent may execute caller-supplied Python through the configured "
+                "external sandbox when the caller explicitly requests execution. Do not "
+                "plan local or unapproved execution. "
+                if coding and "code_execution" in coding.enabled_tools
+                else "Coding may produce or review code but must not plan code execution. "
+            )
         role_contracts = (
             " Registered role contracts:\n" + "\n".join(descriptions)
             if descriptions
@@ -63,10 +88,7 @@ class Planner:
                 f"{self.max_tasks} tasks, unique short IDs, explicit dependencies, and "
                 f"only these configured agent names: {names}. "
                 "Select agents only for work inside their declared contracts. "
-                "All optional non-model tools are disabled unless explicitly listed as enabled; "
-                "do not advertise browsing, code execution, filesystem, database, or other "
-                "tools that are not enabled. Research may use only caller-supplied sources. "
-                "Do not claim tools, files, or external research are available."
+                 + tool_policy
                 + role_contracts,
             ),
             Message("user", request.strip()),

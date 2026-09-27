@@ -60,6 +60,36 @@ class FakeResearchProvider(SafeWebResearchProvider):
 
 
 class RuntimeIntegrationTests(unittest.TestCase):
+    def test_planner_prompt_matches_live_tool_registry(self):
+        disabled_backend = RuntimeBackend(agent="research")
+        disabled = ChatService(disabled_backend)
+        disabled.orchestrator.planner.plan("Summarize supplied sources")
+        disabled_prompt = disabled_backend.completions[0][0].content
+        self.assertIn("Research may use only caller-supplied sources", disabled_prompt)
+        self.assertIn("must not plan code execution", disabled_prompt)
+
+        enabled_backend = RuntimeBackend(agent="research")
+        enabled = ChatService(
+            enabled_backend,
+            web_provider=FakeResearchProvider(),
+            python_tool=SandboxedPythonTool(FakeExternalSandbox()),
+        )
+        enabled.orchestrator.planner.plan("Plan approved research and authorized execution")
+        enabled_prompt = enabled_backend.completions[0][0].content
+        self.assertIn("fetch explicitly approved web URLs", enabled_prompt)
+        self.assertIn("execute caller-supplied Python through the configured", enabled_prompt)
+        self.assertIn("Enabled tools: web_browsing", enabled_prompt)
+        self.assertIn("Enabled tools: code_execution", enabled_prompt)
+        self.assertNotIn("Research may use only caller-supplied sources", enabled_prompt)
+        research_contract = next(
+            line for line in enabled_prompt.splitlines() if line.startswith("research:")
+        )
+        coding_contract = next(
+            line for line in enabled_prompt.splitlines() if line.startswith("coding:")
+        )
+        self.assertNotIn("do not browse", research_contract.lower())
+        self.assertNotIn("do not execute code", coding_contract.lower())
+
     def test_execution_is_denied_by_default_and_prompt_cannot_authorize_it(self):
         backend = RuntimeBackend(agent="coding")
         service = ChatService(backend)

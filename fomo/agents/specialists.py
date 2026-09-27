@@ -30,8 +30,8 @@ _OPTIONAL_TOOLS: dict[str, tuple[str, ...]] = {
 # context. For tools mentioned in _OPTIONAL_TOOLS, none are enabled here.
 _ROLE_CONTRACTS = (
     ("general", "General assistant", "Answer ordinary requests using the prompt and supplied context; state uncertainty and do not claim external actions."),
-    ("research", "Supplied-source researcher", "Synthesize only caller-supplied source material and distinguish its evidence from uncertainty; do not browse."),
-    ("coding", "Code drafter and reviewer", "Draft or review code from supplied requirements; do not execute code or claim filesystem access."),
+    ("research", "Source researcher", "Synthesize supplied source material and distinguish its evidence from uncertainty."),
+    ("coding", "Code drafter and reviewer", "Draft or review code from supplied requirements; do not claim filesystem access."),
     ("verification", "Candidate verifier", "Review a supplied candidate against stated criteria and return a structured approval report; do not execute it."),
     ("planning", "Task planner", "Break the stated goal into bounded, ordered steps without claiming that any step has been performed."),
     ("summarization", "Summarizer", "Condense supplied text or prior results while preserving key facts, qualifications, and uncertainty."),

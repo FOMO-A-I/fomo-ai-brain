@@ -5,6 +5,7 @@ from fomo.agents.coding_agent import CodingAgent
 from fomo.agents.orchestrator import FomoOrchestrator, OrchestrationError
 from fomo.agents.planner import Planner, PlanningError
 from fomo.agents.registry import (
+    AgentCapability,
     AgentNotFoundError,
     AgentRegistry,
     create_default_registry,
@@ -189,6 +190,56 @@ class PlannerAgentTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(PlanningError, "unsupported planned agent"):
             Planner(ScriptedBackend([unsupported]), registry).plan("Browse the web")
+
+    def test_planner_tool_policy_follows_enabled_capabilities(self):
+        plan = json.dumps({
+            "tasks": [
+                {"id": "research", "description": "Research", "agent": "research", "depends_on": []},
+                {"id": "code", "description": "Code", "agent": "coding", "depends_on": []},
+            ]
+        })
+        for web_enabled in (False, True):
+            for execution_enabled in (False, True):
+                with self.subTest(web=web_enabled, execution=execution_enabled):
+                    registry = AgentRegistry()
+                    registry.register(
+                        "research",
+                        EchoAgent(),
+                        capability=AgentCapability(
+                            "research", "Researcher", "Summarize sources",
+                            optional_tools=("web_browsing",),
+                            enabled_tools=("web_browsing",) if web_enabled else (),
+                        ),
+                    )
+                    registry.register(
+                        "coding",
+                        EchoAgent(),
+                        capability=AgentCapability(
+                            "coding", "Coder", "Write code",
+                            optional_tools=("code_execution",),
+                            enabled_tools=("code_execution",) if execution_enabled else (),
+                        ),
+                    )
+                    backend = ScriptedBackend([plan])
+                    tasks = Planner(backend, registry).plan("Handle the approved request")
+                    self.assertEqual([task.agent for task in tasks], ["research", "coding"])
+                    prompt = backend.requests[0][0].content
+                    if web_enabled:
+                        self.assertIn("fetch explicitly approved web URLs", prompt)
+                        self.assertIn("Enabled tools: web_browsing", prompt)
+                        self.assertNotIn("Research may use only caller-supplied sources", prompt)
+                        self.assertNotIn("Do not claim tools, files, or external research", prompt)
+                    else:
+                        self.assertIn("Research may use only caller-supplied sources", prompt)
+                        self.assertIn("Do not plan external web research", prompt)
+                        self.assertIn("Enabled tools: none", prompt)
+                    if execution_enabled:
+                        self.assertIn("execute caller-supplied Python through the configured", prompt)
+                        self.assertIn("Enabled tools: code_execution", prompt)
+                        self.assertNotIn("must not plan code execution", prompt)
+                    else:
+                        self.assertIn("must not plan code execution", prompt)
+                        self.assertNotIn("execute caller-supplied Python through the configured", prompt)
 
     def test_registry_requires_explicit_capabilities(self):
         registry = AgentRegistry({"general": EchoAgent()})
