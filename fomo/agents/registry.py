@@ -19,11 +19,11 @@ class AgentNotFoundError(LookupError):
 
 @dataclass(frozen=True, slots=True)
 class AgentCapability:
-    """Honest contract for one registered agent.
+    """Capability contract for a registered agent.
 
     ``optional_tools`` names integrations that could extend an agent, while
     ``enabled_tools`` lists integrations explicitly supplied by its owner.
-    The built-in registry enables no non-model tools.
+    The default registry starts with no non-model tools enabled.
     """
 
     name: str

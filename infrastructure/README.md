@@ -1,20 +1,16 @@
-# Deployment building blocks
+# Infrastructure
 
-These files target a machine or cluster **you operate**. They do not provision
-GPUs, provision a production database, deploy a model, or train a checkpoint.
+Components for operator-managed deployments:
 
-- `docker/Dockerfile` builds a CPU development image. Replace its PyTorch wheel
-  with a CUDA-compatible one when preparing a GPU image.
-- `gpu/launch.py` validates the actual checkpoint and CUDA availability before
-  starting the API process. Its checks fail rather than loading an unrelated model.
-- `workers/router.py` is a bounded HTTP worker pool for configured inference
-  backends; use only trusted endpoints on a private network.
-- `postgres/schema.sql` documents the server-side storage and ownership schema
-  for a future multi-user site. The reference API does **not** automatically
-  switch to PostgreSQL or provide user accounts.
-- `monitoring/metrics.py` exports local counters in Prometheus text format.
+- `docker/Dockerfile` builds a CPU development image. A GPU image needs a
+  CUDA-compatible PyTorch build.
+- `gpu/launch.py` checks the checkpoint and CUDA availability before starting
+  the API.
+- `workers/router.py` routes requests across configured inference workers.
+  Configure only trusted endpoints on a private network.
+- `postgres/schema.sql` defines storage and ownership tables for a site
+  backend. The local API does not use this schema or manage user accounts.
+- `monitoring/metrics.py` exports local counters in Prometheus format.
 
-**Not yet provided:** distributed GPU scheduler, secure remote code execution,
-production authentication, GPU autoscaling, a deployed moderation model, and a
-trained FOMO checkpoint. These need datasets, infrastructure, access controls,
-and load/safety testing; they must not be simulated with placeholders.
+GPU provisioning, distributed scheduling, remote code isolation, production
+authentication, autoscaling, and moderation require separate services.

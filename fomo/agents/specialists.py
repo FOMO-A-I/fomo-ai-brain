@@ -1,8 +1,4 @@
-"""Role-conditioned agents sharing the configured model backend.
-
-The specialist names describe prompt-level work contracts. They do not imply
-separate training, external knowledge retrieval, or non-model tool access.
-"""
+"""Model-backed role profiles and capability declarations."""
 
 from __future__ import annotations
 
@@ -26,8 +22,7 @@ _OPTIONAL_TOOLS: dict[str, tuple[str, ...]] = {
     "sql": ("database",),
 }
 
-# Each description states what the model may do with the request and supplied
-# context. For tools mentioned in _OPTIONAL_TOOLS, none are enabled here.
+# Role contracts describe model behavior; registry wiring enables optional tools.
 _ROLE_CONTRACTS = (
     ("general", "General assistant", "Answer ordinary requests using the prompt and supplied context; state uncertainty and do not claim external actions."),
     ("research", "Source researcher", "Synthesize supplied source material and distinguish its evidence from uncertainty."),

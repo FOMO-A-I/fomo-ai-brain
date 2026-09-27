@@ -67,8 +67,8 @@ python -m evals \
   --json-out benchmark-report.json
 ```
 
-`python -m evals.generate` uses only `fomo.brain.model.LocalTransformersBackend`;
-it does not select a fallback model. The backend verifies the local checkpoint
+`python -m evals.generate` loads the specified checkpoint through
+`fomo.brain.model.LocalTransformersBackend`. The backend verifies the local
 manifest and artifacts before inference. Generation is greedy (`temperature=0`,
 `do_sample=false`). Each response line binds the response to the raw case-file
 SHA-256, that case's prompt SHA-256, verified checkpoint ID and manifest
@@ -79,25 +79,17 @@ file, prompt, checkpoint manifest, or settings ID differs, and fails closed on
 partial or malformed provenance. Candidate-byte hashes are also included in
 the report.
 
-The generated metadata is validated but not signed: strict evaluation cannot
-prove that someone actually ran inference on that checkpoint. Its binding means
-the recorded hashes/settings agree with the current inputs, not cryptographic
-proof of the response's origin. Generated candidates do not use
-`--operator-attested-candidate`; that flag is reserved for unmarked external
-candidate files, whose limitations remain explicit in the report. Generation
-preserves case IDs and order, rejects existing output unless `--overwrite` is
-specified, and writes atomically only after all generations succeed. It accepts
-at most 10,000 cases, a 100 MiB case file, and 100,000 characters per prompt.
+Provenance metadata is unsigned. Matching hashes and settings establish
+consistency with the current inputs, not proof of response origin. The
+`--operator-attested-candidate` flag applies to unmarked external candidate
+files; generated candidates use their recorded provenance. Generation preserves
+case IDs and order, rejects existing output unless `--overwrite` is specified,
+and writes atomically after all generations succeed. Limits are 10,000 cases,
+100 MiB per case file, and 100,000 characters per prompt.
 
-The command flow is ready for a real GPU checkpoint and genuinely held-out
-cases. Unit tests use an injected fake backend solely to exercise file handling
-and failure behavior; those fixtures are not inference results or benchmark
-evidence.
-
-The default mode remains `offline_label_check`. It remains compatible with
-case-embedded responses and optional candidate files, and reports explicitly
-state that there is no checkpoint binding. Do not describe an offline label
-check as a measured checkpoint benchmark.
+Unit tests use an injected backend for file handling and error paths; they do
+not measure checkpoint quality. The default `offline_label_check` mode accepts
+case-embedded responses or a candidate file and reports no checkpoint binding.
 
 ## JSONL contract
 
