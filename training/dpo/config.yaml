@@ -1,0 +1,23 @@
+# DPO begins from a completed SFT checkpoint and human-ranked preference pairs.
+seed: 42
+max_length: 4096
+max_prompt_length: 2048
+num_train_epochs: 1
+learning_rate: 0.00005
+per_device_train_batch_size: 1
+per_device_eval_batch_size: 1
+gradient_accumulation_steps: 16
+warmup_ratio: 0.03
+weight_decay: 0.01
+logging_steps: 10
+eval_steps: 100
+save_steps: 100
+save_total_limit: 3
+gradient_checkpointing: true
+bf16: true
+fp16: false
+beta: 0.1
+loss_type: sigmoid
+model_adapter_name: fomo_policy
+ref_adapter_name: fomo_sft_reference
+trust_remote_code: false

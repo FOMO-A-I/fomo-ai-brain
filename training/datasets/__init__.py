@@ -1,0 +1,1 @@
+"""Dataset ingestion, cleaning, validation, formatting, and deterministic splits."""

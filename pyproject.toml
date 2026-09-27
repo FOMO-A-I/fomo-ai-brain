@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fomo-ai-brain"
+version = "0.3.0"
+description = "Independent checkpoint training, evaluation and agent runtime"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+fomo-api = "fomo.api.server:main"
+
+[tool.setuptools.packages.find]
+include = ["fomo*", "training*", "evals*"]

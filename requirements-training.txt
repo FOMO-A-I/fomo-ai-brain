@@ -1,0 +1,11 @@
+# Install this file inside a dedicated training environment with a CUDA-compatible
+# PyTorch wheel selected for that host (see https://pytorch.org/get-started/locally/).
+# The standalone agent has no dependency on this GPU-only optional stack.
+torch>=2.4,<3
+transformers>=4.45,<5
+datasets>=3,<5
+accelerate>=1,<2
+peft>=0.13,<1
+trl>=0.18,<1
+PyYAML>=6,<7
+safetensors>=0.4,<1

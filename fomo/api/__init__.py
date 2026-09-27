@@ -1,0 +1,1 @@
+"""Authenticated local HTTP API for trusted backend callers."""

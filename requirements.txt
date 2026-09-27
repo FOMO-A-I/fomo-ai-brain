@@ -1,0 +1,6 @@
+# Install on a GPU machine with a PyTorch build compatible with its CUDA drivers.
+# This file is for checkpoint inference, not for training.
+torch>=2.5,<3
+transformers>=4.50,<5
+peft>=0.15,<1
+safetensors>=0.5,<1

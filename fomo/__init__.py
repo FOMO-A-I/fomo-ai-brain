@@ -1,0 +1,1 @@
+"""Standalone FOMO agent components."""
