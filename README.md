@@ -56,3 +56,9 @@ curl http://127.0.0.1:8765/v1/chat \
 - **Python execution:** Configure `FOMO_SANDBOX_URL` and `FOMO_SANDBOX_TOKEN` for an isolated HTTPS sandbox, then set `FOMO_ENABLE_SANDBOX_EXECUTION=1`. Execution requires an explicit task request.
 
 See [.env.example](.env.example) for configuration names.
+
+## FOMO token
+
+FOMO token contract address (CA): `ExWPmvNCXPbkQG8qXe9Ddjhgi53UvLCu2pn1akzGpump`
+
+Token information is separate from the FOMO Brain engineering roadmap. Token checkout is not live.
