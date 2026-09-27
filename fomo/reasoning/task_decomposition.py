@@ -7,7 +7,46 @@ import re
 from typing import Iterable
 
 
-AGENT_NAMES = frozenset({"research", "coding", "verification", "general"})
+AGENT_NAMES = frozenset(
+    {
+        "general",
+        "research",
+        "coding",
+        "verification",
+        "planning",
+        "summarization",
+        "writing",
+        "editing",
+        "analysis",
+        "math",
+        "science",
+        "history",
+        "language",
+        "translation",
+        "tutoring",
+        "brainstorming",
+        "product",
+        "architecture",
+        "debugging",
+        "testing",
+        "security_review",
+        "privacy_review",
+        "data_analysis",
+        "sql",
+        "documentation",
+        "qa",
+        "critique",
+        "fact_check",
+        "extraction",
+        "classification",
+        "accessibility",
+        "ux",
+        "legal_information",
+        "medical_information",
+        "finance_information",
+        "decision_support",
+    }
+)
 _IDENTIFIER = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$")
 
 
@@ -28,7 +67,7 @@ class Task:
             raise ValueError("task description must not be empty")
         if len(self.description) > 4000:
             raise ValueError("task description exceeds 4,000 characters")
-        if not isinstance(self.agent, str) or self.agent not in AGENT_NAMES:
+        if not isinstance(self.agent, str) or not _IDENTIFIER.fullmatch(self.agent):
             raise ValueError(f"unsupported task agent: {self.agent!r}")
         if not isinstance(self.depends_on, tuple) or not all(
             isinstance(item, str) and _IDENTIFIER.fullmatch(item) for item in self.depends_on

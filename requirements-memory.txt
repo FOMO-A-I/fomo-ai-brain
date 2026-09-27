@@ -1,0 +1,5 @@
+# Optional local embedding model for the opt-in SQLite memory feature.
+# Install with the runtime requirements in an environment with a compatible
+# PyTorch build. No model is downloaded or bundled by this file.
+-r requirements.txt
+sentence-transformers>=3,<6

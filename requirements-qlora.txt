@@ -1,0 +1,3 @@
+# Install after requirements-training.txt in the same CUDA training environment.
+# Select a CUDA-compatible PyTorch wheel for the host before installing training extras.
+bitsandbytes>=0.45,<1

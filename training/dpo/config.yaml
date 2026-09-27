@@ -1,4 +1,6 @@
 # DPO begins from a completed SFT checkpoint and human-ranked preference pairs.
+# Set load_in_4bit: true for optional NF4 QLoRA. Memory use varies by model/GPU;
+# 4-bit does not guarantee that a workload fits on every 32 GB card.
 seed: 42
 max_length: 4096
 max_prompt_length: 2048
@@ -21,3 +23,6 @@ loss_type: sigmoid
 model_adapter_name: fomo_policy
 ref_adapter_name: fomo_sft_reference
 trust_remote_code: false
+load_in_4bit: false
+# Set true to prohibit fetching base-model files from the Hub.
+local_files_only: false

@@ -6,6 +6,11 @@ from pathlib import Path
 
 from evals import EvaluationError, evaluate_case, run_suite
 from evals.__main__ import main
+from evals.benchmark import (
+    generation_settings_identifier,
+    validate_candidate_provenance,
+)
+from evals.generate import generate_candidates
 from evals.regression import compare_case, summarize_regressions
 from evals.runner import load_candidates, load_cases, read_jsonl
 from training.model_registry import register_checkpoint, seal_checkpoint
@@ -358,14 +363,17 @@ class EvaluationTests(unittest.TestCase):
             registry_before = registry_path.read_bytes()
             manifest_before = (checkpoint_dir / ".fomo-checkpoint.json").read_bytes()
 
-            result = main([
+            strict_args = [
                 "--cases", str(cases_path),
                 "--candidate", str(candidates_path),
                 "--checkpoint", manifest["checkpoint_id"],
                 "--registry", str(registry_path),
                 "--generation-settings-id", "vllm-temp0-top-p1-v1",
                 "--json-out", str(report_path),
-            ])
+            ]
+            self.assertEqual(main(strict_args), 2)
+            self.assertFalse(report_path.exists())
+            result = main([*strict_args, "--operator-attested-candidate"])
 
             self.assertEqual(result, 0)
             report = json.loads(report_path.read_text(encoding="utf-8"))
@@ -406,6 +414,7 @@ class EvaluationTests(unittest.TestCase):
                 "--candidate", str(candidates_path),
                 "--checkpoint", str(checkpoint_dir),
                 "--generation-settings-id", "settings-test",
+                "--operator-attested-candidate",
                 "--publish",
                 "--json-out", str(report_path),
             ])
@@ -436,6 +445,7 @@ class EvaluationTests(unittest.TestCase):
                 "--candidate", str(candidates_path),
                 "--checkpoint", str(checkpoint_dir),
                 "--generation-settings-id", "settings-test",
+                "--operator-attested-candidate",
                 "--json-out", str(report_path),
             ])
             self.assertEqual(result, 2)
@@ -451,6 +461,7 @@ class EvaluationTests(unittest.TestCase):
                 "--candidate", str(candidates_path),
                 "--checkpoint", str(checkpoint_dir),
                 "--generation-settings-id", "settings-test",
+                "--operator-attested-candidate",
                 "--json-out", str(report_path),
             ])
             self.assertEqual(result, 2)
@@ -476,6 +487,7 @@ class EvaluationTests(unittest.TestCase):
                 "--candidate", str(candidates_path),
                 "--checkpoint", str(checkpoint_dir),
                 "--generation-settings-id", "settings-test",
+                "--operator-attested-candidate",
                 "--json-out", str(report_path),
             ]
             self.assertEqual(main(common), 2)
@@ -487,6 +499,122 @@ class EvaluationTests(unittest.TestCase):
                 "--json-out", str(report_path),
             ]), 2)
             self.assertEqual(main(["--cases", str(cases_path), "--publish"]), 2)
+
+    def test_strict_mode_rejects_generated_candidate_bound_to_old_same_id_case_file(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            checkpoint_dir, _registry_path, manifest = self.make_registered_checkpoint(root)
+            cases_path = root / "held-out.jsonl"
+            candidates_path = root / "generated.jsonl"
+            report_path = root / "report.json"
+            original_case = {
+                "id": "stable-case-id",
+                "category": "reasoning",
+                "prompt": "What is 2 + 2?",
+                "expect": {"numeric_answer": 4},
+            }
+            cases_path.write_text(json.dumps(original_case) + "\n", encoding="utf-8")
+            original_case_hash = hashlib.sha256(cases_path.read_bytes()).hexdigest()
+            settings = {
+                "backend": "LocalTransformersBackend",
+                "temperature": 0,
+                "do_sample": False,
+                "max_new_tokens": 128,
+                "device_map": "auto",
+                "deterministic": True,
+                "seed": None,
+            }
+            settings_id = generation_settings_identifier(settings)
+            provenance = {
+                "schema": "fomo-generated-candidate-v1",
+                "case_file_sha256": original_case_hash,
+                "prompt_sha256": hashlib.sha256(original_case["prompt"].encode()).hexdigest(),
+                "checkpoint_id": manifest["checkpoint_id"],
+                "checkpoint_manifest_sha256": hashlib.sha256(
+                    (checkpoint_dir / ".fomo-checkpoint.json").read_bytes()
+                ).hexdigest(),
+                "generation_settings_id": settings_id,
+                "generation_settings": settings,
+            }
+            candidates_path.write_text(
+                json.dumps({
+                    "id": original_case["id"],
+                    "response": "4",
+                    "provenance": provenance,
+                }) + "\n",
+                encoding="utf-8",
+            )
+
+            # The ID and prompt are stable, but changed labels alter the raw
+            # case-file bytes; matching IDs alone must not pass strict binding.
+            changed_case = {**original_case, "expect": {"numeric_answer": 5}}
+            cases_path.write_text(json.dumps(changed_case) + "\n", encoding="utf-8")
+            result = main([
+                "--cases", str(cases_path),
+                "--candidate", str(candidates_path),
+                "--checkpoint", str(checkpoint_dir),
+                "--generation-settings-id", settings_id,
+                "--json-out", str(report_path),
+            ])
+            self.assertEqual(result, 2)
+            self.assertFalse(report_path.exists())
+
+    def test_generated_provenance_rejects_checkpoint_and_settings_mismatches(self):
+        case = {
+            "id": "bound",
+            "category": "reasoning",
+            "prompt": "Answer",
+            "expect": {"exact": "ok"},
+        }
+        case_hash = hashlib.sha256(b"stable case JSONL bytes").hexdigest()
+        manifest_hash = hashlib.sha256(b"verified manifest fixture").hexdigest()
+        settings = {
+            "backend": "LocalTransformersBackend",
+            "temperature": 0,
+            "do_sample": False,
+            "max_new_tokens": 16,
+            "device_map": "auto",
+            "deterministic": True,
+            "seed": None,
+        }
+        settings_id = generation_settings_identifier(settings)
+        record = {
+            "id": case["id"],
+            "response": "unit-test-only",
+            "provenance": {
+                "schema": "fomo-generated-candidate-v1",
+                "case_file_sha256": case_hash,
+                "prompt_sha256": hashlib.sha256(case["prompt"].encode()).hexdigest(),
+                "checkpoint_id": "fixture-checkpoint",
+                "checkpoint_manifest_sha256": manifest_hash,
+                "generation_settings_id": settings_id,
+                "generation_settings": settings,
+            },
+        }
+
+        wrong_manifest = json.loads(json.dumps(record))
+        wrong_manifest["provenance"]["checkpoint_manifest_sha256"] = "0" * 64
+        with self.assertRaisesRegex(EvaluationError, "different checkpoint manifest"):
+            validate_candidate_provenance(
+                {case["id"]: wrong_manifest},
+                [case],
+                case_file_sha256=case_hash,
+                checkpoint_id="fixture-checkpoint",
+                checkpoint_manifest_sha256=manifest_hash,
+                generation_settings_id=settings_id,
+                operator_attested=False,
+            )
+
+        with self.assertRaisesRegex(EvaluationError, "generation settings ID"):
+            validate_candidate_provenance(
+                {case["id"]: record},
+                [case],
+                case_file_sha256=case_hash,
+                checkpoint_id="fixture-checkpoint",
+                checkpoint_manifest_sha256=manifest_hash,
+                generation_settings_id="different-settings-id",
+                operator_attested=False,
+            )
 
     def test_category_schema_and_response_map_loading(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -503,6 +631,122 @@ class EvaluationTests(unittest.TestCase):
             candidate_map = load_candidates(candidate_path)
             self.assertEqual(candidate_map["c"]["response"], "def f(): pass")
             self.assertTrue(run_suite(cases, candidate_map)["cases"][0]["passed"])
+
+    def test_local_generation_writes_complete_candidates_with_recorded_settings(self):
+        class FakeBackend:
+            def __init__(self):
+                self.prompts = []
+
+            def complete(self, messages):
+                self.prompts.append(messages[-1]["content"])
+                return f"response to {messages[-1]['content']}"
+
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            checkpoint_dir, registry_path, manifest = self.make_registered_checkpoint(root)
+            cases_path = root / "held-out.jsonl"
+            output_path = root / "candidate.jsonl"
+            cases = [
+                {"id": "stable-a", "category": "reasoning", "prompt": "First prompt", "expect": {"exact": "x"}},
+                {"id": "stable-b", "category": "reasoning", "prompt": "Second prompt", "expect": {"exact": "y"}},
+            ]
+            cases_path.write_text(
+                "".join(json.dumps(case) + "\n" for case in cases),
+                encoding="utf-8",
+            )
+            backend = FakeBackend()
+
+            result = generate_candidates(
+                cases_path=cases_path,
+                output_path=output_path,
+                checkpoint=str(checkpoint_dir),
+                registry_path=registry_path,
+                max_new_tokens=64,
+                backend=backend,
+            )
+
+            records = [json.loads(line) for line in output_path.read_text(encoding="utf-8").splitlines()]
+            self.assertEqual([record["id"] for record in records], ["stable-a", "stable-b"])
+            self.assertEqual(backend.prompts, ["First prompt", "Second prompt"])
+            self.assertEqual([record["response"] for record in records], [
+                "response to First prompt", "response to Second prompt",
+            ])
+            for index, record in enumerate(records):
+                provenance = record["provenance"]
+                settings = provenance["generation_settings"]
+                self.assertEqual(settings["backend"], "FakeBackend")
+                self.assertFalse(settings["deterministic"])
+                self.assertEqual(settings["temperature"], 0)
+                self.assertFalse(settings["do_sample"])
+                self.assertEqual(settings["max_new_tokens"], 64)
+                self.assertEqual(provenance["checkpoint_id"], manifest["checkpoint_id"])
+                self.assertEqual(
+                    provenance["checkpoint_manifest_sha256"],
+                    hashlib.sha256(
+                        (checkpoint_dir / ".fomo-checkpoint.json").read_bytes()
+                    ).hexdigest(),
+                )
+                self.assertEqual(
+                    provenance["case_file_sha256"],
+                    hashlib.sha256(cases_path.read_bytes()).hexdigest(),
+                )
+                self.assertEqual(
+                    provenance["prompt_sha256"],
+                    hashlib.sha256(cases[index]["prompt"].encode()).hexdigest(),
+                )
+                self.assertEqual(
+                    provenance["generation_settings_id"],
+                    result["generation_settings_id"],
+                )
+            self.assertEqual(result["case_count"], 2)
+            with self.assertRaisesRegex(EvaluationError, "unsupported or non-deterministic"):
+                validate_candidate_provenance(
+                    {record["id"]: record for record in records},
+                    cases,
+                    case_file_sha256=hashlib.sha256(cases_path.read_bytes()).hexdigest(),
+                    checkpoint_id=manifest["checkpoint_id"],
+                    checkpoint_manifest_sha256=hashlib.sha256(
+                        (checkpoint_dir / ".fomo-checkpoint.json").read_bytes()
+                    ).hexdigest(),
+                    generation_settings_id=result["generation_settings_id"],
+                    operator_attested=False,
+                )
+
+            with self.assertRaisesRegex(EvaluationError, "already exists"):
+                generate_candidates(
+                    cases_path=cases_path,
+                    output_path=output_path,
+                    checkpoint=str(checkpoint_dir),
+                    registry_path=registry_path,
+                    backend=backend,
+                )
+
+    def test_generation_model_error_does_not_publish_partial_candidate_file(self):
+        class FailingBackend:
+            def complete(self, messages):
+                if messages[-1]["content"] == "second":
+                    raise RuntimeError("inference fixture failure")
+                return "first response"
+
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            checkpoint_dir, registry_path, _manifest = self.make_registered_checkpoint(root)
+            cases_path = root / "held-out.jsonl"
+            output_path = root / "candidate.jsonl"
+            cases_path.write_text(
+                '{"id":"one","category":"reasoning","prompt":"first","expect":{"exact":"a"}}\n'
+                '{"id":"two","category":"reasoning","prompt":"second","expect":{"exact":"b"}}\n',
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(EvaluationError, "generation failed for case 'two'"):
+                generate_candidates(
+                    cases_path=cases_path,
+                    output_path=output_path,
+                    checkpoint=str(checkpoint_dir),
+                    registry_path=registry_path,
+                    backend=FailingBackend(),
+                )
+            self.assertFalse(output_path.exists())
 
 
 if __name__ == "__main__":

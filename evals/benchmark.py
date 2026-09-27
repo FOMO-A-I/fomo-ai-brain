@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -18,6 +19,176 @@ def sha256_file(path: str | Path) -> str:
     except OSError as exc:
         raise EvaluationError(f"Cannot hash file {path}: {exc}") from exc
     return digest.hexdigest()
+
+
+def generation_settings_identifier(settings: Mapping[str, Any]) -> str:
+    """Stable ID over the complete generation configuration."""
+    serialized = json.dumps(
+        settings,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    digest = hashlib.sha256(serialized).hexdigest()[:16]
+    prefix = (
+        "local-transformers-v1"
+        if settings.get("backend") == "LocalTransformersBackend"
+        else "injected-backend-v1"
+    )
+    return f"{prefix}-{digest}"
+
+
+def validate_candidate_provenance(
+    records: Mapping[str, Mapping[str, Any]],
+    cases: list[Mapping[str, Any]],
+    *,
+    case_file_sha256: str,
+    checkpoint_id: str,
+    checkpoint_manifest_sha256: str,
+    generation_settings_id: str,
+    operator_attested: bool,
+) -> dict[str, Any]:
+    """Verify generated-response bindings or require an explicit external attestation."""
+    case_ids = {case["id"] for case in cases}
+    if set(records) != case_ids:
+        raise EvaluationError("Candidate provenance validation requires exact case ID coverage")
+
+    marked_records = [
+        record for record in records.values()
+        if any(key in record for key in (
+            "provenance",
+            "generation_settings",
+            "generation_settings_id",
+            "case_file_sha256",
+            "prompt_sha256",
+            "checkpoint_id",
+            "checkpoint_manifest_sha256",
+        ))
+    ]
+    if not marked_records:
+        if not operator_attested:
+            raise EvaluationError(
+                "Candidate file has no generated provenance; pass "
+                "--operator-attested-candidate to accept an external candidate with "
+                "explicit self-attested limitations"
+            )
+        return {
+            "mode": "operator_attested_external",
+            "candidate_provenance": "operator-attested external JSONL; not independently verified",
+        }
+    if len(marked_records) != len(records):
+        raise EvaluationError(
+            "Candidate file mixes generated-provenance records with unmarked records"
+        )
+    if operator_attested:
+        raise EvaluationError(
+            "--operator-attested-candidate cannot be used to bypass generated provenance validation"
+        )
+
+    cases_by_id = {case["id"]: case for case in cases}
+    common_settings: Mapping[str, Any] | None = None
+    for case_id, record in records.items():
+        if set(record) != {"id", "response", "provenance"}:
+            raise EvaluationError(
+                f"Generated candidate {case_id!r} has unexpected or incomplete record fields"
+            )
+        provenance = record.get("provenance")
+        if not isinstance(provenance, Mapping):
+            raise EvaluationError(f"Candidate {case_id!r} has malformed generated provenance")
+        expected_keys = {
+            "schema",
+            "case_file_sha256",
+            "prompt_sha256",
+            "checkpoint_id",
+            "checkpoint_manifest_sha256",
+            "generation_settings_id",
+            "generation_settings",
+        }
+        if set(provenance) != expected_keys:
+            raise EvaluationError(
+                f"Candidate {case_id!r} has incomplete or unknown generated provenance fields"
+            )
+        if provenance["schema"] != "fomo-generated-candidate-v1":
+            raise EvaluationError(f"Candidate {case_id!r} has an unsupported provenance schema")
+        if provenance["case_file_sha256"] != case_file_sha256:
+            raise EvaluationError(
+                f"Candidate {case_id!r} is bound to a different case file SHA-256"
+            )
+        prompt_digest = hashlib.sha256(
+            cases_by_id[case_id]["prompt"].encode("utf-8")
+        ).hexdigest()
+        if provenance["prompt_sha256"] != prompt_digest:
+            raise EvaluationError(
+                f"Candidate {case_id!r} is bound to a different prompt SHA-256"
+            )
+        if provenance["checkpoint_id"] != checkpoint_id:
+            raise EvaluationError(f"Candidate {case_id!r} is bound to a different checkpoint ID")
+        if provenance["checkpoint_manifest_sha256"] != checkpoint_manifest_sha256:
+            raise EvaluationError(
+                f"Candidate {case_id!r} is bound to a different checkpoint manifest SHA-256"
+            )
+        if provenance["generation_settings_id"] != generation_settings_id:
+            raise EvaluationError(
+                f"Candidate {case_id!r} generation settings ID does not match "
+                "--generation-settings-id"
+            )
+        settings = provenance["generation_settings"]
+        if not isinstance(settings, Mapping):
+            raise EvaluationError(f"Candidate {case_id!r} has malformed generation settings")
+        required_settings = {
+            "backend",
+            "temperature",
+            "do_sample",
+            "max_new_tokens",
+            "device_map",
+            "deterministic",
+            "seed",
+        }
+        if set(settings) != required_settings:
+            raise EvaluationError(
+                f"Candidate {case_id!r} has incomplete or unknown generation settings"
+            )
+        if (
+            settings["backend"] != "LocalTransformersBackend"
+            or isinstance(settings["temperature"], bool)
+            or not isinstance(settings["temperature"], (int, float))
+            or settings["temperature"] != 0
+            or settings["do_sample"] is not False
+            or isinstance(settings["max_new_tokens"], bool)
+            or not isinstance(settings["max_new_tokens"], int)
+            or not 1 <= settings["max_new_tokens"] <= 8192
+            or not isinstance(settings["device_map"], str)
+            or not settings["device_map"].strip()
+            or settings["deterministic"] is not True
+            or settings["seed"] is not None
+        ):
+            raise EvaluationError(
+                f"Candidate {case_id!r} declares unsupported or non-deterministic generation settings"
+            )
+        if generation_settings_identifier(settings) != generation_settings_id:
+            raise EvaluationError(
+                f"Candidate {case_id!r} generation settings do not match their recorded ID"
+            )
+        if common_settings is None:
+            common_settings = settings
+        elif dict(settings) != dict(common_settings):
+            raise EvaluationError("Candidate records declare inconsistent generation settings")
+        response = record.get("response")
+        if not isinstance(response, str) or not response.strip():
+            raise EvaluationError(
+                f"Generated candidate {case_id!r} needs a non-empty response string"
+            )
+
+    return {
+        "mode": "generated_local_transformers",
+        "candidate_provenance": (
+            "generated-response metadata matched to current case/prompt hashes, "
+            "verified checkpoint manifest, and generation settings; inference itself "
+            "remains self-attested"
+        ),
+        "generation_settings": dict(common_settings or {}),
+        "generation_settings_id": generation_settings_id,
+    }
 
 
 def checkpoint_identity(

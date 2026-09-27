@@ -58,10 +58,63 @@ def validate_config(config: dict[str, Any], required: set[str]) -> None:
             raise DatasetError("Training config warmup_ratio must be in [0, 1)")
         if key == "weight_decay" and value < 0:
             raise DatasetError("Training config weight_decay must be non-negative")
-        if key in {"bf16", "fp16", "gradient_checkpointing", "trust_remote_code"} and not isinstance(value, bool):
+        if key in {
+            "bf16", "fp16", "gradient_checkpointing", "trust_remote_code",
+            "load_in_4bit", "local_files_only",
+        } and not isinstance(value, bool):
             raise DatasetError(f"Training config {key} must be true or false")
     if config.get("bf16") and config.get("fp16"):
         raise DatasetError("Select at most one of bf16 or fp16")
+    if config.get("load_in_4bit") and not (config.get("bf16") or config.get("fp16")):
+        raise DatasetError("4-bit QLoRA requires exactly one of bf16 or fp16 for compute dtype")
+
+
+def apply_qlora_override(config: dict[str, Any], override: bool | None) -> dict[str, Any]:
+    """Return effective config, allowing CLI opt-in/out to override YAML."""
+    effective = dict(config)
+    if override is not None:
+        effective["load_in_4bit"] = override
+    return effective
+
+
+def make_4bit_quantization_config(config_class: Any, compute_dtype: Any) -> Any:
+    """Construct the explicit NF4 + double-quant BitsAndBytes config."""
+    return config_class(
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_compute_dtype=compute_dtype,
+    )
+
+
+def model_quantization_kwargs(
+    enabled: bool, config_class: Any, compute_dtype: Any
+) -> dict[str, Any]:
+    """Return only the model kwargs needed for opted-in 4-bit loading."""
+    if not enabled:
+        return {}
+    return {
+        "quantization_config": make_4bit_quantization_config(config_class, compute_dtype),
+        "device_map": "auto",
+    }
+
+
+def prepare_kbit_model(model: Any, prepare_function: Any, *, gradient_checkpointing: bool) -> Any:
+    """Apply PEFT's supported k-bit preparation before attaching LoRA adapters."""
+    return prepare_function(model, use_gradient_checkpointing=gradient_checkpointing)
+
+
+def qlora_metadata(enabled: bool, compute_dtype: str | None = None) -> dict[str, Any]:
+    """Stable training provenance for the base-model quantization mode."""
+    if not enabled:
+        return {"enabled": False}
+    return {
+        "enabled": True,
+        "bits": 4,
+        "quant_type": "nf4",
+        "double_quant": True,
+        "compute_dtype": compute_dtype,
+    }
 
 
 def summarize_dataset(path: str | Path, kind: str, *, human_preferences: bool = True) -> dict[str, Any]:
@@ -155,7 +208,7 @@ def assert_disjoint_datasets(
         )
 
 
-def require_training_dependencies() -> dict[str, Any]:
+def require_training_dependencies(*, qlora: bool = False) -> dict[str, Any]:
     names = ("torch", "transformers", "datasets", "peft", "trl", "accelerate")
     modules = {}
     missing = []
@@ -169,6 +222,14 @@ def require_training_dependencies() -> dict[str, Any]:
             "Training extras are missing: " + ", ".join(missing)
             + ". Install requirements-training.txt in the GPU environment."
         )
+    if qlora:
+        try:
+            modules["bitsandbytes"] = importlib.import_module("bitsandbytes")
+        except ImportError as exc:
+            raise RuntimeError(
+                "4-bit QLoRA requires bitsandbytes. Install requirements-qlora.txt "
+                "in the CUDA training environment; no training was started."
+            ) from exc
     return modules
 
 
@@ -180,18 +241,32 @@ def require_cuda(torch: Any, *, bf16: bool, fp16: bool) -> None:
         )
     if bf16 and not torch.cuda.is_bf16_supported():
         raise RuntimeError("Config requests bf16, but this GPU does not support bf16.")
-    if fp16 and not torch.cuda.is_available():
-        raise RuntimeError("Config requests fp16, but no CUDA GPU is available.")
 
 
-def load_json_dataset(path: str | Path, kind: str, datasets_module: Any) -> Any:
-    """Load validated JSONL via Arrow and strip provenance from model input."""
-    dataset = datasets_module.load_dataset("json", data_files=str(path), split="train")
+def load_json_dataset(
+    path: str | Path, kind: str, datasets_module: Any, *, human_preferences: bool = True
+) -> Any:
+    """Validate and normalize JSONL rows, then exclude provenance from model inputs."""
+    if kind not in {"sft", "dpo"}:
+        raise DatasetError("kind must be 'sft' or 'dpo'")
     columns = ["messages"] if kind == "sft" else ["prompt", "chosen", "rejected"]
-    missing = sorted(set(columns) - set(dataset.column_names))
-    if missing:
-        raise DatasetError(f"Formatted dataset is missing model columns: {missing}")
-    return dataset.select_columns(columns)
+    model_rows = []
+    for row in read_jsonl(path):
+        # Repeat record validation at the loader boundary so the training
+        # representation is derived from validated content, never raw fields.
+        clean = validate_sft_record(row) if kind == "sft" else validate_dpo_record(
+            row, human_preferences=human_preferences
+        )
+        model_rows.append({column: clean[column] for column in columns})
+    if not model_rows:
+        raise DatasetError(f"Training dataset is empty: {path}")
+    dataset_class = getattr(datasets_module, "Dataset", None)
+    if dataset_class is None or not callable(getattr(dataset_class, "from_list", None)):
+        raise RuntimeError(
+            "The installed datasets package must provide Dataset.from_list to normalize "
+            "validated training records."
+        )
+    return dataset_class.from_list(model_rows)
 
 
 def supported_kwargs(callable_object: Any, values: dict[str, Any]) -> dict[str, Any]:

@@ -1,4 +1,6 @@
 # Conservative LoRA defaults. This config does not identify or download a model.
+# Set load_in_4bit: true for optional NF4 QLoRA. Memory use varies by model/GPU;
+# 4-bit does not guarantee that a workload fits on every 32 GB card.
 seed: 42
 max_length: 4096
 num_train_epochs: 3
@@ -19,3 +21,6 @@ lora_r: 16
 lora_alpha: 32
 lora_dropout: 0.05
 trust_remote_code: false
+load_in_4bit: false
+# Set true to prohibit fetching model files from the Hub.
+local_files_only: false

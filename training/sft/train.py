@@ -19,11 +19,15 @@ from training.datasets.validate import validate_file
 from training.model_registry import seal_checkpoint
 from training.train_utils import (
     checkpoint_metadata,
+    apply_qlora_override,
     load_json_dataset,
     load_yaml_config,
     assert_disjoint_datasets,
     require_cuda,
     require_training_dependencies,
+    model_quantization_kwargs,
+    prepare_kbit_model,
+    qlora_metadata,
     summarize_dataset,
     supported_kwargs,
     validate_config,
@@ -35,6 +39,7 @@ _REQUIRED_CONFIG = {
     "per_device_train_batch_size", "per_device_eval_batch_size",
     "gradient_accumulation_steps", "lora_r", "lora_alpha", "lora_dropout",
     "bf16", "fp16", "gradient_checkpointing", "trust_remote_code",
+    "load_in_4bit", "local_files_only",
 }
 
 
@@ -50,6 +55,10 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Confirm you reviewed base model license/terms for this use",
     )
     parser.add_argument("--base-model-revision", help="Pinned model revision/commit")
+    qlora = parser.add_mutually_exclusive_group()
+    qlora.add_argument("--qlora", dest="qlora", action="store_true", help="Opt into 4-bit NF4 QLoRA")
+    qlora.add_argument("--no-qlora", dest="qlora", action="store_false", help="Use ordinary LoRA")
+    parser.set_defaults(qlora=None)
     parser.add_argument("--config", default=str(Path(__file__).with_name("config.yaml")))
     parser.add_argument(
         "--allow-possible-secrets", action="store_true",
@@ -84,7 +93,7 @@ def _preflight(args: argparse.Namespace, config: dict[str, Any]) -> tuple[dict[s
 
 def run(argv: list[str] | None = None) -> dict[str, Any] | None:
     args = _parse_args(argv)
-    config = load_yaml_config(args.config)
+    config = apply_qlora_override(load_yaml_config(args.config), args.qlora)
     train_summary, validation_summary = _preflight(args, config)
     if args.dry_run:
         print(
@@ -94,28 +103,40 @@ def run(argv: list[str] | None = None) -> dict[str, Any] | None:
         )
         return None
 
-    modules = require_training_dependencies()
+    modules = require_training_dependencies(qlora=bool(config["load_in_4bit"]))
     torch = modules["torch"]
     require_cuda(torch, bf16=bool(config["bf16"]), fp16=bool(config["fp16"]))
     from peft import LoraConfig, TaskType
-    from transformers import AutoModelForCausalLM, AutoTokenizer, set_seed
+    from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, set_seed
     from trl import SFTConfig, SFTTrainer
 
     set_seed(int(config["seed"]))
     model_kwargs: dict[str, Any] = {
         "revision": args.base_model_revision,
         "trust_remote_code": bool(config["trust_remote_code"]),
+        "local_files_only": bool(config["local_files_only"]),
         "torch_dtype": torch.bfloat16 if config["bf16"] else (
             torch.float16 if config["fp16"] else "auto"
         ),
     }
+    if config["load_in_4bit"]:
+        compute_dtype = torch.bfloat16 if config["bf16"] else torch.float16
+        model_kwargs.update(model_quantization_kwargs(True, BitsAndBytesConfig, compute_dtype))
     if args.base_model_revision is None:
         model_kwargs.pop("revision")
     model = AutoModelForCausalLM.from_pretrained(args.base_model, **model_kwargs)
+    if config["load_in_4bit"]:
+        from peft import prepare_model_for_kbit_training
+        model = prepare_kbit_model(
+            model,
+            prepare_model_for_kbit_training,
+            gradient_checkpointing=bool(config["gradient_checkpointing"]),
+        )
     tokenizer = AutoTokenizer.from_pretrained(
         args.base_model,
         revision=args.base_model_revision,
         trust_remote_code=bool(config["trust_remote_code"]),
+        local_files_only=bool(config["local_files_only"]),
     )
     if tokenizer.pad_token is None:
         if tokenizer.eos_token is None:
@@ -204,10 +225,17 @@ def run(argv: list[str] | None = None) -> dict[str, Any] | None:
         config=config,
         extra={
             "adapter": "LoRA",
+            "quantization": qlora_metadata(
+                bool(config["load_in_4bit"]),
+                "bfloat16" if config["bf16"] else ("float16" if config["fp16"] else None),
+            ),
             "validation_metrics": eval_metrics,
             "libraries": {
                 name: getattr(modules[name], "__version__", "unknown")
-                for name in ("torch", "transformers", "datasets", "peft", "trl", "accelerate")
+                for name in (
+                    "torch", "transformers", "datasets", "peft", "trl", "accelerate",
+                    *(("bitsandbytes",) if config["load_in_4bit"] else ()),
+                )
             },
         },
     )

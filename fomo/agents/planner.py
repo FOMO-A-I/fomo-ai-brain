@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import json
-from typing import Any
 
 from fomo.brain.context import Message
 from fomo.brain.model import ModelBackend
 from fomo.reasoning.execution_graph import ExecutionGraph, GraphError
-from fomo.reasoning.task_decomposition import AGENT_NAMES, Task
+from fomo.reasoning.task_decomposition import Task
+
+from .registry import AgentRegistry
 
 
 class PlanningError(RuntimeError):
@@ -16,15 +17,42 @@ class PlanningError(RuntimeError):
 
 
 class Planner:
-    def __init__(self, model: ModelBackend, *, max_tasks: int = 8) -> None:
+    def __init__(
+        self,
+        model: ModelBackend,
+        agents: AgentRegistry | None = None,
+        *,
+        max_tasks: int = 8,
+    ) -> None:
         if not 1 <= max_tasks <= 32:
             raise ValueError("max_tasks must be between 1 and 32")
         self.model = model
         self.max_tasks = max_tasks
+        self.agents = agents
+
+    def bind_registry(self, agents: AgentRegistry) -> None:
+        """Bind planning to the exact registry that will execute the plan."""
+        self.agents = agents
 
     def plan(self, request: str) -> list[Task]:
         if not isinstance(request, str) or not request.strip() or len(request) > 10_000:
             raise ValueError("request must contain 1–10,000 characters")
+        if self.agents is None:
+            raise PlanningError("planner requires an explicitly configured agent registry")
+        if not self.agents.names:
+            raise PlanningError("planner cannot plan with an empty agent registry")
+        capabilities = self.agents.capabilities
+        descriptions = [
+            f"{name}: {capabilities[name].role} — {capabilities[name].capability}"
+            for name in self.agents.names
+            if name in capabilities
+        ]
+        names = ", ".join(self.agents.names)
+        role_contracts = (
+            " Registered role contracts:\n" + "\n".join(descriptions)
+            if descriptions
+            else ""
+        )
         messages = [
             Message(
                 "system",
@@ -33,8 +61,13 @@ class Planner:
                 '{"tasks":[{"id":"step-1","description":"...","agent":"general",'
                 '"depends_on":[]}]} . Use 1 to '
                 f"{self.max_tasks} tasks, unique short IDs, explicit dependencies, and "
-                "only these agent names: general, research, coding, verification. "
-                "Do not claim tools, files, or research are available unless supplied.",
+                f"only these configured agent names: {names}. "
+                "Select agents only for work inside their declared contracts. "
+                "All optional non-model tools are disabled unless explicitly listed as enabled; "
+                "do not advertise browsing, code execution, filesystem, database, or other "
+                "tools that are not enabled. Research may use only caller-supplied sources. "
+                "Do not claim tools, files, or external research are available."
+                + role_contracts,
             ),
             Message("user", request.strip()),
         ]
@@ -60,7 +93,7 @@ class Planner:
                 "depends_on",
             }:
                 raise PlanningError("each task must include exactly id, description, agent, depends_on")
-            if not isinstance(item["agent"], str) or item["agent"] not in AGENT_NAMES:
+            if not isinstance(item["agent"], str) or item["agent"] not in self.agents.names:
                 raise PlanningError(f"unsupported planned agent: {item['agent']!r}")
             dependencies = item["depends_on"]
             if not isinstance(dependencies, list) or not all(

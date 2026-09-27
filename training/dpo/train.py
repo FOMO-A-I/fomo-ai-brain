@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -17,10 +19,14 @@ from training.model_registry import read_checkpoint_manifest, seal_checkpoint
 from training.train_utils import (
     checkpoint_metadata,
     assert_disjoint_datasets,
+    apply_qlora_override,
     load_json_dataset,
     load_yaml_config,
     require_cuda,
     require_training_dependencies,
+    model_quantization_kwargs,
+    prepare_kbit_model,
+    qlora_metadata,
     summarize_dataset,
     supported_kwargs,
     validate_config,
@@ -33,6 +39,7 @@ _REQUIRED_CONFIG = {
     "gradient_accumulation_steps", "beta", "loss_type", "bf16", "fp16",
     "gradient_checkpointing", "trust_remote_code", "model_adapter_name",
     "ref_adapter_name",
+    "load_in_4bit", "local_files_only",
 }
 
 def _require_named_adapter_support(dpo_config_class: Any, trl_version: str) -> None:
@@ -93,12 +100,65 @@ def _load_sft_adapter_pair(
     return model
 
 
+def _validate_quantization_compatibility(parent: dict[str, Any], config: dict[str, Any]) -> None:
+    """Keep DPO's reference base in the same quantization mode as its SFT parent."""
+    parent_quantization = parent.get("quantization", {"enabled": False})
+    if not isinstance(parent_quantization, dict):
+        raise DatasetError("SFT checkpoint has invalid quantization provenance")
+    parent_enabled = bool(parent_quantization.get("enabled", False))
+    if parent_enabled != bool(config["load_in_4bit"]):
+        raise DatasetError(
+            "DPO quantization mode must match its verified SFT checkpoint so the frozen "
+            "SFT reference uses the same base-model representation"
+        )
+    if parent_enabled:
+        dtype = "bfloat16" if config["bf16"] else "float16"
+        if parent_quantization.get("compute_dtype") != dtype:
+            raise DatasetError(
+                "DPO compute dtype must match the QLoRA SFT checkpoint for the frozen "
+                "reference base"
+            )
+
+
+def _publish_policy_adapter(trainer: Any, output_dir: str | Path, policy_name: str) -> None:
+    """Export just the trained policy adapter to the root PEFT layout."""
+    output = Path(output_dir).resolve()
+    if Path(policy_name).name != policy_name or policy_name in {".", ".."}:
+        raise DatasetError("DPO policy adapter name must be a simple adapter identifier")
+    with tempfile.TemporaryDirectory(prefix=".fomo-dpo-export-", dir=output.parent) as tmp:
+        staged = Path(tmp) / "model"
+        trainer.save_model(str(staged))
+        # PEFT stores named adapters in per-adapter subdirectories. Its default
+        # adapter is the sole standard exception and is saved directly at root.
+        source = staged if policy_name == "default" else staged / policy_name
+        config_file = source / "adapter_config.json"
+        if not config_file.is_file():
+            raise RuntimeError(
+                f"DPO trainer did not save policy adapter {policy_name!r} in the expected "
+                "PEFT layout; refusing to seal a non-loadable checkpoint"
+            )
+        adapter_files = [
+            path for path in source.glob("adapter_model*")
+            if path.is_file() and path.suffix in {".safetensors", ".bin", ".json"}
+        ]
+        if not any(path.suffix in {".safetensors", ".bin"} for path in adapter_files):
+            raise RuntimeError(
+                f"DPO policy adapter {policy_name!r} has no recognized adapter weights"
+            )
+        for path in [config_file, *adapter_files]:
+            shutil.copy2(path, output / path.name)
+
+
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--train", required=True, help="Validated DPO training JSONL")
     parser.add_argument("--validation", required=True, help="Held-out DPO evaluation JSONL")
     parser.add_argument("--sft-checkpoint", required=True, help="Completed SFT checkpoint directory")
     parser.add_argument("--output-dir", required=True)
+    qlora = parser.add_mutually_exclusive_group()
+    qlora.add_argument("--qlora", dest="qlora", action="store_true", help="Opt into 4-bit NF4 QLoRA")
+    qlora.add_argument("--no-qlora", dest="qlora", action="store_false", help="Use ordinary LoRA")
+    parser.set_defaults(qlora=None)
     parser.add_argument("--config", default=str(Path(__file__).with_name("config.yaml")))
     parser.add_argument(
         "--allow-nonhuman-preferences", action="store_true",
@@ -129,6 +189,7 @@ def _preflight(
     parent = read_checkpoint_manifest(args.sft_checkpoint, verify_files=True)
     if parent.get("method") != "sft":
         raise DatasetError("DPO must start from a completed SFT checkpoint")
+    _validate_quantization_compatibility(parent, config)
     if not (Path(args.sft_checkpoint) / "adapter_config.json").is_file():
         raise DatasetError(
             "DPO requires a completed PEFT SFT checkpoint with adapter_config.json "
@@ -159,7 +220,7 @@ def _preflight(
 
 def run(argv: list[str] | None = None) -> dict[str, Any] | None:
     args = _parse_args(argv)
-    config = load_yaml_config(args.config)
+    config = apply_qlora_override(load_yaml_config(args.config), args.qlora)
     parent, train_summary, eval_summary = _preflight(args, config)
     if args.dry_run:
         print(
@@ -169,10 +230,10 @@ def run(argv: list[str] | None = None) -> dict[str, Any] | None:
         )
         return None
 
-    modules = require_training_dependencies()
+    modules = require_training_dependencies(qlora=bool(config["load_in_4bit"]))
     torch = modules["torch"]
     from peft import PeftConfig, PeftModel
-    from transformers import AutoModelForCausalLM, AutoTokenizer, set_seed
+    from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, set_seed
     from trl import DPOConfig, DPOTrainer
 
     trl_version = getattr(modules["trl"], "__version__", "unknown")
@@ -185,10 +246,14 @@ def run(argv: list[str] | None = None) -> dict[str, Any] | None:
     model_kwargs: dict[str, Any] = {
         "revision": base_revision,
         "trust_remote_code": bool(config["trust_remote_code"]),
+        "local_files_only": bool(config["local_files_only"]),
         "torch_dtype": torch.bfloat16 if config["bf16"] else (
             torch.float16 if config["fp16"] else "auto"
         ),
     }
+    if config["load_in_4bit"]:
+        compute_dtype = torch.bfloat16 if config["bf16"] else torch.float16
+        model_kwargs.update(model_quantization_kwargs(True, BitsAndBytesConfig, compute_dtype))
     if base_revision is None:
         model_kwargs.pop("revision")
     if not (source / "adapter_config.json").is_file():
@@ -203,6 +268,13 @@ def run(argv: list[str] | None = None) -> dict[str, Any] | None:
             "SFT adapter base model does not match its verified checkpoint manifest"
         )
     base_model = AutoModelForCausalLM.from_pretrained(source_base, **model_kwargs)
+    if config["load_in_4bit"]:
+        from peft import prepare_model_for_kbit_training
+        base_model = prepare_kbit_model(
+            base_model,
+            prepare_model_for_kbit_training,
+            gradient_checkpointing=bool(config["gradient_checkpointing"]),
+        )
     model = _load_sft_adapter_pair(
         base_model,
         source,
@@ -211,15 +283,22 @@ def run(argv: list[str] | None = None) -> dict[str, Any] | None:
         reference_name=str(config["ref_adapter_name"]),
     )
     tokenizer = AutoTokenizer.from_pretrained(
-        str(source), trust_remote_code=bool(config["trust_remote_code"])
+        str(source),
+        trust_remote_code=bool(config["trust_remote_code"]),
+        local_files_only=True,
     )
     if tokenizer.pad_token is None:
         if tokenizer.eos_token is None:
             raise RuntimeError("Tokenizer has neither a pad token nor an EOS token")
         tokenizer.pad_token = tokenizer.eos_token
     model.config.use_cache = False
-    train_dataset = load_json_dataset(args.train, "dpo", modules["datasets"])
-    eval_dataset = load_json_dataset(args.validation, "dpo", modules["datasets"])
+    human_preferences = not args.allow_nonhuman_preferences
+    train_dataset = load_json_dataset(
+        args.train, "dpo", modules["datasets"], human_preferences=human_preferences
+    )
+    eval_dataset = load_json_dataset(
+        args.validation, "dpo", modules["datasets"], human_preferences=human_preferences
+    )
     output = Path(args.output_dir).resolve()
     output.mkdir(parents=True, exist_ok=True)
 
@@ -279,14 +358,13 @@ def run(argv: list[str] | None = None) -> dict[str, Any] | None:
     trainer = DPOTrainer(**trainer_kwargs)
     train_result = trainer.train()
     eval_metrics = trainer.evaluate()
-    trainer.save_model(str(output))
+    _publish_policy_adapter(trainer, output, str(config["model_adapter_name"]))
     tokenizer.save_pretrained(str(output))
     trainer.save_state()
     metrics = {"train": train_result.metrics, "evaluation": eval_metrics}
     (output / "fomo-training-metrics.json").write_text(
         json.dumps(metrics, indent=2, sort_keys=True, default=str) + "\n", encoding="utf-8"
     )
-    human_preferences = not args.allow_nonhuman_preferences
     metadata = checkpoint_metadata(
         method="dpo",
         base_model=source_base,
@@ -302,11 +380,18 @@ def run(argv: list[str] | None = None) -> dict[str, Any] | None:
             "policy_adapter": str(config["model_adapter_name"]),
             "reference_adapter": str(config["ref_adapter_name"]),
             "reference_policy": "frozen-copy-of-sft-adapter",
+            "quantization": qlora_metadata(
+                bool(config["load_in_4bit"]),
+                "bfloat16" if config["bf16"] else ("float16" if config["fp16"] else None),
+            ),
             "preference_source_policy": "human-only" if human_preferences else "explicitly-allowed-nonhuman",
             "validation_metrics": eval_metrics,
             "libraries": {
                 name: getattr(modules[name], "__version__", "unknown")
-                for name in ("torch", "transformers", "datasets", "peft", "trl", "accelerate")
+                for name in (
+                    "torch", "transformers", "datasets", "peft", "trl", "accelerate",
+                    *(("bitsandbytes",) if config["load_in_4bit"] else ()),
+                )
             },
         },
     )

@@ -9,7 +9,9 @@ from dataclasses import dataclass
 from training.dpo.train import (
     _load_sft_adapter_pair,
     _named_adapter_config_values,
+    _publish_policy_adapter,
     _require_named_adapter_support,
+    _validate_quantization_compatibility,
 )
 from training.common import DatasetError, read_jsonl, write_jsonl
 from training.datasets.clean import clean_records
@@ -22,6 +24,15 @@ from training.model_registry import (
     read_checkpoint_manifest,
     resolve_checkpoint,
     seal_checkpoint,
+)
+from training.train_utils import (
+    apply_qlora_override,
+    model_quantization_kwargs,
+    prepare_kbit_model,
+    qlora_metadata,
+    load_json_dataset,
+    require_cuda,
+    validate_config,
 )
 
 
@@ -58,6 +69,56 @@ def dpo_record(index: int, *, provenance: dict | None = None) -> dict:
 
 
 class DatasetValidationTests(unittest.TestCase):
+    def test_sft_loader_normalizes_both_documented_input_formats(self) -> None:
+        class FakeDataset:
+            def __init__(self, rows):
+                self.rows = rows
+
+            @classmethod
+            def from_list(cls, rows):
+                return cls(rows)
+
+        class FakeDatasets:
+            Dataset = FakeDataset
+
+        message_record = {
+            "record_id": "messages-1",
+            "messages": [
+                {"role": "user", "content": "Help"},
+                {"role": "assistant", "content": "Certainly."},
+            ],
+            "provenance": dict(PROVENANCE),
+        }
+        instruction_record = {
+            "record_id": "instruction-1",
+            "system": "Be precise",
+            "instruction": "Explain this",
+            "response": "Here is the explanation.",
+            "provenance": dict(PROVENANCE),
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            for filename, record, expected_messages in (
+                (
+                    "messages.jsonl",
+                    message_record,
+                    message_record["messages"],
+                ),
+                (
+                    "instruction.jsonl",
+                    instruction_record,
+                    [
+                        {"role": "system", "content": "Be precise"},
+                        {"role": "user", "content": "Explain this"},
+                        {"role": "assistant", "content": "Here is the explanation."},
+                    ],
+                ),
+            ):
+                path = Path(directory) / filename
+                write_jsonl(path, [record])
+                dataset = load_json_dataset(path, "sft", FakeDatasets)
+                self.assertEqual(dataset.rows, [{"messages": expected_messages}])
+                self.assertNotIn("provenance", dataset.rows[0])
+
     def test_instruction_response_is_formatted_as_conversation(self) -> None:
         record = format_record(sft_record(1))
         self.assertEqual(
@@ -288,6 +349,157 @@ class DpoReferenceSemanticsTests(unittest.TestCase):
         self.assertEqual(reference_load[1], policy_load[2])
         self.assertEqual(reference_load[2:], ("fomo_sft_reference", False))
         self.assertEqual(activate, ("set_adapter", "fomo_policy"))
+
+    def test_published_dpo_checkpoint_has_only_root_policy_adapter_and_valid_manifest(self) -> None:
+        class FakeTrainer:
+            def save_model(self, path):
+                staged = Path(path)
+                for name, payload in (
+                    ("fomo_policy", b"trained-policy-fixture"),
+                    ("fomo_sft_reference", b"frozen-reference-fixture"),
+                ):
+                    adapter_dir = staged / name
+                    adapter_dir.mkdir(parents=True)
+                    (adapter_dir / "adapter_config.json").write_text(
+                        json.dumps({"base_model_name_or_path": "owner/model"}),
+                        encoding="utf-8",
+                    )
+                    (adapter_dir / "adapter_model.safetensors").write_bytes(payload)
+
+        with tempfile.TemporaryDirectory() as directory:
+            checkpoint = Path(directory) / "dpo-output"
+            checkpoint.mkdir()
+            _publish_policy_adapter(FakeTrainer(), checkpoint, "fomo_policy")
+            self.assertTrue((checkpoint / "adapter_config.json").is_file())
+            self.assertEqual(
+                (checkpoint / "adapter_model.safetensors").read_bytes(),
+                b"trained-policy-fixture",
+            )
+            self.assertFalse((checkpoint / "fomo_sft_reference").exists())
+
+            seal_checkpoint(
+                checkpoint,
+                {
+                    "method": "dpo",
+                    "base_model": "owner/model",
+                    "base_model_license": "test-only",
+                    "base_model_terms_reviewed": True,
+                    "dataset": {"sha256": "b" * 64},
+                    "examples_trained": 1,
+                    "policy_adapter": "fomo_policy",
+                    "reference_adapter": "fomo_sft_reference",
+                    "reference_policy": "frozen-copy-of-sft-adapter",
+                },
+            )
+            manifest = read_checkpoint_manifest(checkpoint, verify_files=True)
+            self.assertIn("adapter_config.json", manifest["files"])
+            self.assertIn("adapter_model.safetensors", manifest["files"])
+            self.assertNotIn("fomo_sft_reference/adapter_model.safetensors", manifest["files"])
+
+
+class QLoRATests(unittest.TestCase):
+    def test_nf4_double_quant_config_is_explicit_and_dtype_is_forwarded(self) -> None:
+        calls = []
+
+        class FakeBitsAndBytesConfig:
+            def __init__(self, **kwargs):
+                calls.append(kwargs)
+
+        result = model_quantization_kwargs(
+            True, FakeBitsAndBytesConfig, "mock-bfloat16"
+        )
+        self.assertEqual(result["device_map"], "auto")
+        self.assertEqual(calls, [{
+            "load_in_4bit": True,
+            "bnb_4bit_quant_type": "nf4",
+            "bnb_4bit_use_double_quant": True,
+            "bnb_4bit_compute_dtype": "mock-bfloat16",
+        }])
+
+    def test_non_qlora_lora_adds_no_quantization_model_kwargs(self) -> None:
+        class UnexpectedBitsAndBytesConfig:
+            def __init__(self, **kwargs):
+                raise AssertionError("quantization config should not be constructed")
+
+        self.assertEqual(
+            model_quantization_kwargs(False, UnexpectedBitsAndBytesConfig, object()), {}
+        )
+        self.assertFalse(apply_qlora_override({"load_in_4bit": False}, None)["load_in_4bit"])
+        self.assertTrue(apply_qlora_override({"load_in_4bit": False}, True)["load_in_4bit"])
+        self.assertFalse(apply_qlora_override({"load_in_4bit": True}, False)["load_in_4bit"])
+        self.assertEqual(qlora_metadata(False), {"enabled": False})
+
+    def test_kbit_preparation_uses_gradient_checkpointing_setting(self) -> None:
+        calls = []
+        model = object()
+
+        def prepare(received_model, **kwargs):
+            calls.append((received_model, kwargs))
+            return "prepared-model"
+
+        prepared = prepare_kbit_model(model, prepare, gradient_checkpointing=True)
+        self.assertEqual(prepared, "prepared-model")
+        self.assertEqual(calls, [(model, {"use_gradient_checkpointing": True})])
+
+    def test_qlora_requires_a_single_supported_compute_dtype(self) -> None:
+        valid = {"bf16": True, "fp16": False, "load_in_4bit": True}
+        validate_config(valid, {"bf16", "fp16", "load_in_4bit"})
+        with self.assertRaisesRegex(DatasetError, "requires exactly one"):
+            validate_config(
+                {"bf16": False, "fp16": False, "load_in_4bit": True},
+                {"bf16", "fp16", "load_in_4bit"},
+            )
+        with self.assertRaisesRegex(DatasetError, "at most one"):
+            validate_config(
+                {"bf16": True, "fp16": True, "load_in_4bit": True},
+                {"bf16", "fp16", "load_in_4bit"},
+            )
+
+    def test_cuda_dtype_preflight_fails_closed_and_allows_supported_modes(self) -> None:
+        class FakeCuda:
+            available = True
+            bf16_supported = True
+
+            def is_available(self):
+                return self.available
+
+            def is_bf16_supported(self):
+                return self.bf16_supported
+
+        class FakeTorch:
+            cuda = FakeCuda()
+
+        FakeTorch.cuda.available = False
+        with self.assertRaisesRegex(RuntimeError, "requires a CUDA GPU"):
+            require_cuda(FakeTorch, bf16=False, fp16=True)
+        FakeTorch.cuda.available = True
+        FakeTorch.cuda.bf16_supported = False
+        with self.assertRaisesRegex(RuntimeError, "does not support bf16"):
+            require_cuda(FakeTorch, bf16=True, fp16=False)
+        require_cuda(FakeTorch, bf16=False, fp16=True)
+
+    def test_dpo_requires_parent_sft_quantization_and_compute_dtype_match(self) -> None:
+        parent = {"quantization": {
+            "enabled": True,
+            "bits": 4,
+            "quant_type": "nf4",
+            "double_quant": True,
+            "compute_dtype": "bfloat16",
+        }}
+        config = {"load_in_4bit": True, "bf16": True, "fp16": False}
+        _validate_quantization_compatibility(parent, config)
+        with self.assertRaisesRegex(DatasetError, "mode must match"):
+            _validate_quantization_compatibility(
+                parent, {"load_in_4bit": False, "bf16": True, "fp16": False}
+            )
+        with self.assertRaisesRegex(DatasetError, "compute dtype must match"):
+            _validate_quantization_compatibility(
+                parent, {"load_in_4bit": True, "bf16": False, "fp16": True}
+            )
+        _validate_quantization_compatibility(
+            {"quantization": {"enabled": False}},
+            {"load_in_4bit": False, "bf16": True, "fp16": False},
+        )
 
 
 if __name__ == "__main__":

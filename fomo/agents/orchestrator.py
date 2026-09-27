@@ -42,6 +42,7 @@ class FomoOrchestrator:
             raise ValueError("max_tasks must be between 1 and 32")
         self.planner = planner
         self.agents = agents
+        self.planner.bind_registry(agents)
         self.max_tasks = max_tasks
         # Inference has no side effects, but default to one attempt so transient
         # infrastructure errors are visible and are not silently masked.
@@ -52,11 +53,55 @@ class FomoOrchestrator:
         request: str,
         *,
         sources: Sequence[Mapping[str, str]] = (),
+        task_context: Mapping[str, Any] | None = None,
     ) -> OrchestrationResult:
         if not isinstance(request, str) or not request.strip() or len(request) > 10_000:
             raise ValueError("request must contain 1–10,000 characters")
         if not isinstance(sources, Sequence) or isinstance(sources, (str, bytes)):
             raise ValueError("sources must be a sequence")
+        if task_context is None:
+            scoped_context: dict[str, Any] = {}
+        elif not isinstance(task_context, Mapping):
+            raise ValueError("task context must be a mapping")
+        else:
+            allowed_context = {
+                "browse",
+                "research_urls",
+                "approved_urls",
+                "approved_domains",
+                "execution_request",
+                "capabilities",
+            }
+            if set(task_context) - allowed_context:
+                raise ValueError("task context contains unsupported capability fields")
+            scoped_context = dict(task_context)
+            capabilities = scoped_context.get("capabilities", {})
+            if (
+                not isinstance(capabilities, Mapping)
+                or set(capabilities) - {"web_research", "sandbox_execution"}
+                or any(type(value) is not bool for value in capabilities.values())
+            ):
+                raise ValueError("task context capabilities are invalid")
+            if scoped_context.get("browse", False) is not False and scoped_context.get(
+                "browse"
+            ) is not True:
+                raise ValueError("task context browse authorization must be boolean")
+            if scoped_context.get("browse") is True and (
+                capabilities.get("web_research") is not True
+                or not scoped_context.get("research_urls")
+                or not (
+                    scoped_context.get("approved_urls")
+                    or scoped_context.get("approved_domains")
+                )
+            ):
+                raise ValueError("browsing requires scoped URL approval")
+            execution = scoped_context.get("execution_request")
+            if execution is not None and (
+                not isinstance(execution, Mapping)
+                or execution.get("authorized") is not True
+                or capabilities.get("sandbox_execution") is not True
+            ):
+                raise ValueError("sandbox execution requires scoped authorization")
         tasks = self.planner.plan(request)
         if not tasks:
             raise OrchestrationError("planner returned an empty task plan")
@@ -68,7 +113,11 @@ class FomoOrchestrator:
             raise OrchestrationError(f"invalid task graph: {exc}") from exc
 
         outputs: dict[str, str] = {}
-        base_context: dict[str, Any] = {"request": request, "sources": tuple(sources)}
+        base_context: dict[str, Any] = {
+            "request": request,
+            "sources": tuple(sources),
+            **scoped_context,
+        }
         while not graph.finished:
             ready = graph.ready()
             if not ready:

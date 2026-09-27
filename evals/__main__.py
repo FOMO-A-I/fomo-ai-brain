@@ -13,12 +13,14 @@ from .benchmark import (
     ensure_report_does_not_overwrite_inputs,
     require_complete_external_candidates,
     sha256_file,
+    validate_candidate_provenance,
 )
 from .runner import (
     EvaluationError,
     load_baselines,
     load_candidates,
     load_cases,
+    read_jsonl,
     run_suite,
 )
 
@@ -47,7 +49,12 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--generation-settings-id",
-        help="Operator-supplied identifier for the settings used to produce external responses (required in strict mode)",
+        help="Settings ID (required in strict mode; generated candidates must match this recorded ID)",
+    )
+    parser.add_argument(
+        "--operator-attested-candidate",
+        action="store_true",
+        help="Explicitly accept an unbound external candidate file; strict report will retain self-attested limitations",
     )
     parser.add_argument(
         "--publish",
@@ -71,6 +78,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise EvaluationError("Strict benchmarking requires --json-out to preserve the provenance-bound report")
         if not strict and args.generation_settings_id:
             raise EvaluationError("--generation-settings-id requires --checkpoint or --publish")
+        if not strict and args.operator_attested_candidate:
+            raise EvaluationError("--operator-attested-candidate requires --checkpoint or --publish")
         ensure_report_does_not_overwrite_inputs(
             args.json_out,
             [args.cases, args.candidate, args.baseline, args.registry if strict else None],
@@ -83,6 +92,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise EvaluationError("Cases file changed while it was being loaded; retry with a stable file")
 
         candidate_hash_before = sha256_file(args.candidate) if strict else None
+        raw_candidates = read_jsonl(args.candidate, kind="candidate") if strict else {}
         candidates = load_candidates(args.candidate) if args.candidate else {}
         candidate_hash_loaded = sha256_file(args.candidate) if strict else None
         if strict and candidate_hash_before != candidate_hash_loaded:
@@ -110,6 +120,41 @@ def main(argv: Sequence[str] | None = None) -> int:
             if binding["case_file_sha256"] != case_hash_loaded:
                 raise EvaluationError("Cases file changed during evaluation; refusing to issue a bound report")
             if binding["candidate_file_sha256"] != candidate_hash_loaded:
+                raise EvaluationError("Candidate file changed during evaluation; refusing to issue a bound report")
+            provenance_check = validate_candidate_provenance(
+                raw_candidates,
+                cases,
+                case_file_sha256=binding["case_file_sha256"],
+                checkpoint_id=binding["checkpoint"]["checkpoint_id"],
+                checkpoint_manifest_sha256=binding["checkpoint"]["manifest_sha256"],
+                generation_settings_id=args.generation_settings_id,
+                operator_attested=args.operator_attested_candidate,
+            )
+            if provenance_check["mode"] == "generated_local_transformers":
+                binding["candidate_provenance"] = provenance_check["candidate_provenance"]
+                binding["generated_candidate_bindings"] = {
+                    "status": "matched",
+                    "generation_settings_id": provenance_check["generation_settings_id"],
+                    "generation_settings": provenance_check["generation_settings"],
+                    "responses_generated_by_evaluator": False,
+                }
+                binding["limitations"] = [
+                    limitation
+                    for limitation in binding["limitations"]
+                    if "response-to-checkpoint association" not in limitation
+                ]
+                binding["limitations"].append(
+                    "Generated candidate metadata hashes and settings were checked, but metadata is not signed; "
+                    "the response-to-checkpoint association and actual inference remain self-attested."
+                )
+            else:
+                binding["candidate_attestation"] = (
+                    "External candidate accepted only by explicit --operator-attested-candidate; "
+                    "response-to-checkpoint association and settings are self-attested."
+                )
+            if sha256_file(args.cases) != case_hash_loaded:
+                raise EvaluationError("Cases file changed during evaluation; refusing to issue a bound report")
+            if sha256_file(args.candidate) != candidate_hash_loaded:
                 raise EvaluationError("Candidate file changed during evaluation; refusing to issue a bound report")
             report["report_type"] = "strict_checkpoint_benchmark"
             report["benchmark"] = binding

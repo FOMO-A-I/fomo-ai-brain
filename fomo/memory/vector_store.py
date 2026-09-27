@@ -147,6 +147,27 @@ class SQLiteVectorStore:
         matches.sort(key=lambda item: (-item["score"], item["id"]))
         return matches[:limit]
 
+    def list(self, user_id: str, limit: int = 50) -> list[dict]:
+        if not isinstance(user_id, str) or not user_id.strip():
+            raise ValueError("user_id must be non-empty text")
+        if type(limit) is not int or not 1 <= limit <= 100:
+            raise ValueError("limit must be an integer between 1 and 100")
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT id,content,metadata_json,created_at FROM vectors "
+                "WHERE user_id=? ORDER BY created_at DESC,id DESC LIMIT ?",
+                (user_id, limit),
+            ).fetchall()
+        return [
+            {
+                "id": row["id"],
+                "content": row["content"],
+                "metadata": json.loads(row["metadata_json"]),
+                "created_at": row["created_at"],
+            }
+            for row in rows
+        ]
+
     def delete(self, user_id: str, item_id: str) -> bool:
         with self._connect() as connection:
             cursor = connection.execute(

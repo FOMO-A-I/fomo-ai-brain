@@ -65,6 +65,22 @@ Remove `--dry-run` on the GPU machine. DPO rejects an absent or altered SFT
 checkpoint. This is DPO, **not PPO-based RLHF or a separately trained reward
 model**. Those would be separate research and infrastructure work.
 
+## Optional 4-bit QLoRA
+
+For memory-constrained CUDA training, install the optional
+`requirements-qlora.txt` alongside the training requirements, with a
+CUDA-compatible PyTorch build. Add `--qlora` to **both** SFT and DPO commands
+above (or set `load_in_4bit: true` in both configurations). The scripts use NF4
+quantization, double quantization, mixed-precision compute and LoRA adapters.
+DPO requires the same quantization mode and compute dtype as its verified SFT
+checkpoint. Set `bf16` or `fp16` to match the GPU, and review sequence length,
+batch size and base-model size before training. `--dry-run` checks inputs but
+does not load the quantized model.
+
+This is an optional path intended to make some workloads feasible on 32 GB
+GPUs, **not a guarantee** that any particular base model or context length
+fits. No 4-bit GPU run has been completed in this repository.
+
 Register a completed checkpoint:
 
 ```bash

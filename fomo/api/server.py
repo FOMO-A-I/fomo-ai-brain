@@ -11,10 +11,14 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from fomo.agents.orchestrator import OrchestrationError
 from fomo.agents.planner import PlanningError
 from fomo.brain.model import CheckpointNotConfigured, LocalTransformersBackend, ModelLoadError
+from fomo.memory.embeddings import EmbeddingUnavailable, LocalSentenceTransformerEmbedder
+from fomo.memory.retrieval import MemoryRetriever
+from fomo.memory.vector_store import SQLiteVectorStore
+from fomo.tools.python_tool import SandboxedPythonTool
+from fomo.tools.research_tool import SafeWebResearchProvider
+from fomo.tools.sandbox import SandboxClient
 
 from .chat import ChatService
-from .models import validate_messages
-
 MAX_REQUEST_BYTES = 64 * 1024
 
 
@@ -44,12 +48,53 @@ def make_server(
     port: int,
     backend: LocalTransformersBackend,
     token: str,
+    *,
+    memory_retriever: MemoryRetriever | None = None,
+    memory_scope_id: str | None = None,
+    enable_web_research: bool = False,
+    web_provider: SafeWebResearchProvider | None = None,
+    enable_sandbox_execution: bool = False,
+    python_tool: SandboxedPythonTool | None = None,
 ) -> ThreadingHTTPServer:
     if host not in ("127.0.0.1", "::1", "localhost"):
         raise ValueError("Bind only to loopback; use a secured reverse proxy for remote access")
     if not token or len(token) < 16:
         raise ValueError("Set FOMO_API_TOKEN to at least 16 characters")
-    service = ChatService(backend)
+    if type(enable_web_research) is not bool or type(enable_sandbox_execution) is not bool:
+        raise ValueError("optional tool enable settings must be booleans")
+    if web_provider is not None and not enable_web_research:
+        raise ValueError("web provider injection requires explicit web research enablement")
+    if python_tool is not None and not enable_sandbox_execution:
+        raise ValueError("sandbox injection requires explicit sandbox execution enablement")
+    if enable_web_research and web_provider is None:
+        web_provider = SafeWebResearchProvider()
+    if enable_sandbox_execution and python_tool is None:
+        # The client requires externally configured HTTPS endpoint and credentials.
+        # It never provides local execution as a fallback.
+        python_tool = SandboxedPythonTool(SandboxClient())
+    if memory_retriever is None and memory_scope_id is None:
+        memory_database = os.getenv("FOMO_MEMORY_DB_PATH")
+        embedding_model = os.getenv("FOMO_EMBEDDING_MODEL_PATH")
+        configured_scope = os.getenv("FOMO_MEMORY_SCOPE_ID")
+        configured = (memory_database, embedding_model, configured_scope)
+        if any(configured):
+            if not all(configured):
+                raise ValueError(
+                    "Configure FOMO_MEMORY_DB_PATH, FOMO_EMBEDDING_MODEL_PATH, "
+                    "and FOMO_MEMORY_SCOPE_ID together"
+                )
+            memory_retriever = MemoryRetriever(
+                LocalSentenceTransformerEmbedder(embedding_model),
+                SQLiteVectorStore(memory_database),
+            )
+            memory_scope_id = configured_scope
+    service = ChatService(
+        backend,
+        memory_retriever,
+        memory_scope_id,
+        web_provider=web_provider,
+        python_tool=python_tool,
+    )
     limiter = RateLimit()
     counters: dict[str, int] = {"ok": 0, "error": 0}
     duration_sum: dict[str, float] = {}
@@ -65,7 +110,7 @@ def make_server(
         def reply(self, status: int, payload: dict) -> None:
             body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
             operation = self.path.split("?", 1)[0]
-            if operation not in ("/health", "/v1/chat", "/v1/infer", "/v1/tasks", "/v1/chat/stream", "/metrics"):
+            if operation not in ("/health", "/v1/chat", "/v1/infer", "/v1/tasks", "/v1/chat/stream", "/v1/memory", "/metrics"):
                 operation = "other"
             with metrics_lock:
                 counters["ok" if status < 400 else "error"] += 1
@@ -128,6 +173,16 @@ def make_server(
                 self.send_header("Content-Length", str(len(text)))
                 self.end_headers()
                 self.wfile.write(text)
+            elif self.path == "/v1/memory":
+                if service.memory_retriever is None:
+                    self.reply(503, {"error": "Memory is not configured"})
+                    return
+                try:
+                    memories = service.memory_retriever.store.list(service.memory_scope_id, 50)
+                except Exception:
+                    self.reply(500, {"error": "Memory read failed"})
+                    return
+                self.reply(200, {"memories": memories})
             else:
                 self.reply(404, {"error": "Not found"})
 
@@ -143,10 +198,22 @@ def make_server(
                     self.reply(200, service.chat(data["messages"]))
                 elif self.path == "/v1/tasks":
                     self.reply(200, service.task(data))
+                elif self.path == "/v1/memory":
+                    if service.memory_retriever is None:
+                        self.reply(503, {"error": "Memory is not configured"})
+                        return
+                    if set(data) - {"content", "metadata"} or "content" not in data:
+                        raise ValueError("Expected content and optional metadata")
+                    memory_id = service.memory_retriever.remember(
+                        service.memory_scope_id,
+                        data["content"],
+                        data.get("metadata"),
+                    )
+                    self.reply(201, {"id": memory_id})
                 elif self.path == "/v1/chat/stream":
                     if set(data) != {"messages"}:
                         raise ValueError("Expected only messages")
-                    messages = validate_messages(data["messages"])
+                    messages = service.prepare_chat_messages(data["messages"])
                     stream = getattr(backend, "stream", None)
                     if not callable(stream):
                         self.reply(501, {"error": "True checkpoint streaming is unavailable"})
@@ -182,6 +249,8 @@ def make_server(
                 self.reply(400, {"error": str(exc)})
             except (CheckpointNotConfigured, ModelLoadError) as exc:
                 self.reply(503, {"error": str(exc)})
+            except EmbeddingUnavailable as exc:
+                self.reply(503, {"error": str(exc)})
             except (PlanningError, OrchestrationError) as exc:
                 self.reply(422, {"error": str(exc)})
             except Exception:
@@ -202,7 +271,20 @@ def main() -> None:
     token = os.getenv("FOMO_API_TOKEN", "")
     host = os.getenv("FOMO_HOST", "127.0.0.1")
     port = int(os.getenv("FOMO_PORT", "8765"))
-    server = make_server(host, port, backend, token)
+    def enabled(name: str) -> bool:
+        value = os.getenv(name, "0")
+        if value not in {"0", "1"}:
+            raise ValueError(f"{name} must be set to 0 or 1")
+        return value == "1"
+
+    server = make_server(
+        host,
+        port,
+        backend,
+        token,
+        enable_web_research=enabled("FOMO_ENABLE_WEB_RESEARCH"),
+        enable_sandbox_execution=enabled("FOMO_ENABLE_SANDBOX_EXECUTION"),
+    )
     print(f"FOMO API configured at http://{host}:{server.server_port}; checkpoint loads on first request")
     try:
         server.serve_forever()

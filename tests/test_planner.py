@@ -2,7 +2,7 @@ import unittest
 
 from fomo.reasoning.execution_graph import ExecutionGraph, GraphError
 from fomo.reasoning.retry_policy import PermanentFailure, RetryPolicy
-from fomo.reasoning.task_decomposition import Task, decompose_task
+from fomo.reasoning.task_decomposition import AGENT_NAMES, Task, decompose_task
 from fomo.reasoning.verification import verify_result
 
 
@@ -19,6 +19,16 @@ class ScriptedBackend:
 
 
 class ReasoningTests(unittest.TestCase):
+    def test_all_36_declared_agent_names_are_valid_task_roles(self):
+        self.assertEqual(len(AGENT_NAMES), 36)
+        self.assertEqual(
+            {
+                Task(f"task-{index}", "Perform assigned role", agent=name).agent
+                for index, name in enumerate(sorted(AGENT_NAMES), 1)
+            },
+            AGENT_NAMES,
+        )
+
     def test_decomposition_builds_sequential_tasks_and_bounds_count(self):
         tasks = decompose_task("Build a feature", ["Inspect", "Implement", "Review"])
         self.assertEqual([task.depends_on for task in tasks], [(), ("task-1",), ("task-2",)])

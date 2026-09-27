@@ -6,8 +6,160 @@ from fomo.tools._http import request_public
 from fomo.tools.api_tool import AllowlistedApiClient, ApiPermission
 from fomo.tools.database_tool import ReadOnlyDatabaseTool
 from fomo.tools.python_tool import SandboxedPythonTool
+from fomo.tools.research_tool import SafeWebResearchProvider
 from fomo.tools.sandbox import SandboxClient, SandboxUnavailable
 from fomo.tools.web_tool import SafeWebFetcher
+
+
+class OptionalAgentToolTests(unittest.TestCase):
+    class Model:
+        def __init__(self):
+            self.messages = None
+
+        def complete(self, messages):
+            self.messages = messages
+            return "Answer [S1]."
+
+    def test_coding_agent_requires_both_sandbox_capability_and_authorized_request(self):
+        from fomo.agents.coding_agent import CodingAgent
+        from fomo.reasoning.task_decomposition import Task
+
+        sandbox = SandboxClient("https://sandbox.example.com", "test-token")
+        tool = SandboxedPythonTool(sandbox)
+        with patch.object(
+            sandbox,
+            "execute",
+            return_value={"stdout": "sandbox output", "stderr": "", "exit_code": 0},
+        ) as execute:
+            self._assert_coding_execution(tool, execute)
+
+    def _assert_coding_execution(self, tool, execute):
+        from fomo.agents.coding_agent import CodingAgent
+        from fomo.reasoning.task_decomposition import Task
+
+        agent = CodingAgent(self.Model(), python_tool=tool)
+        task = Task(id="code", description="Review this calculation", agent="coding")
+        request = {
+            "authorized": True,
+            "code": "print(1 + 1)",
+            "timeout_seconds": 3,
+        }
+        response = agent.run(task, {"execution_request": request})
+        self.assertNotIn("External sandbox execution result", response)
+        execute.assert_not_called()
+
+        response = agent.run(
+            task,
+            {
+                "capabilities": {"sandbox_execution": True},
+                "execution_request": request,
+            },
+        )
+        self.assertIn("sandbox output", response)
+        execute.assert_called_once_with("print(1 + 1)", timeout_seconds=3)
+
+    def test_authorized_execution_without_configured_sandbox_fails_closed(self):
+        from fomo.agents.coding_agent import CodingAgent
+        from fomo.reasoning.task_decomposition import Task
+
+        agent = CodingAgent(self.Model())
+        task = Task(id="code", description="Run the provided test", agent="coding")
+        with self.assertRaisesRegex(RuntimeError, "no external Python sandbox"):
+            agent.run(
+                task,
+                {
+                    "capabilities": {"sandbox_execution": True},
+                    "execution_request": {"authorized": True, "code": "print(1)"},
+                },
+            )
+
+    def test_research_fetches_only_when_requested_and_cites_fetched_url(self):
+        from fomo.agents.research_agent import ResearchAgent
+        from fomo.reasoning.task_decomposition import Task
+
+        events = []
+
+        def transport(url, **kwargs):
+            events.append((url, kwargs["allowed_hosts"]))
+            return (
+                200,
+                {"content-type": "text/html; charset=utf-8"},
+                b"<html><title>Useful page</title><script>ignore()</script><p>Evidence.</p></html>",
+                "research.example",
+            )
+
+        provider = SafeWebResearchProvider(
+            SafeWebFetcher(transport=transport, max_bytes=500_000), max_content_chars=100
+        )
+        agent = ResearchAgent(self.Model(), web_provider=provider)
+        task = Task(id="research", description="Summarize evidence", agent="research")
+        with self.assertRaisesRegex(ValueError, "caller-supplied sources"):
+            agent.run(task, {})
+        self.assertEqual(events, [])
+        agent.run(
+            task,
+            {"sources": [{"title": "Caller source", "content": "Caller evidence."}]},
+        )
+        self.assertEqual(events, [])
+
+        answer = agent.run(
+            task,
+            {
+                "browse": True,
+                "research_urls": ["https://research.example/article"],
+                "approved_domains": ["research.example"],
+            },
+        )
+        self.assertIn(
+            "https://research.example/article",
+            "\n".join(message.content for message in agent.model.messages),
+        )
+        self.assertIn(
+            "Useful page", "\n".join(message.content for message in agent.model.messages)
+        )
+        self.assertIn(
+            "Evidence.", "\n".join(message.content for message in agent.model.messages)
+        )
+        self.assertNotIn(
+            "ignore()", "\n".join(message.content for message in agent.model.messages)
+        )
+        self.assertEqual(events, [("https://research.example/article", {"research.example"})])
+        self.assertEqual(answer, "Answer [S1].")
+
+    def test_research_rejects_unapproved_urls_and_redirects_to_unapproved_hosts(self):
+        responses = {
+            "https://approved.example/start": (
+                302,
+                {"location": "https://other.example/private"},
+                b"",
+                "approved.example",
+            )
+        }
+
+        def transport(url, **kwargs):
+            from urllib.parse import urlsplit
+
+            if urlsplit(url).hostname not in kwargs["allowed_hosts"]:
+                raise ValueError("host is not allowlisted")
+            if url not in responses:
+                raise AssertionError("unapproved redirect reached the transport")
+            return responses[url]
+
+        provider = SafeWebResearchProvider(
+            SafeWebFetcher(transport=transport, max_bytes=500_000)
+        )
+        with self.assertRaisesRegex(ValueError, "not explicitly approved"):
+            provider.fetch(["https://unapproved.example/"], approved_domains=[])
+        with self.assertRaisesRegex(ValueError, "not explicitly approved"):
+            provider.fetch(
+                ["https://approved.example/start"],
+                approved_domains=["approved.example"],
+            )
+        with self.assertRaisesRegex(ValueError, "redirect URL is not explicitly approved"):
+            provider.fetch(
+                ["https://approved.example/start"],
+                approved_urls=["https://approved.example/start"],
+            )
 
 
 class ExternalSandboxTests(unittest.TestCase):

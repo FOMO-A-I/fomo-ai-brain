@@ -29,6 +29,7 @@ python -m evals --cases cases.jsonl \
   --checkpoint 0123456789abcdef01234567 \
   --registry training/checkpoints/registry.json \
   --generation-settings-id "vllm-temp0-top_p1-max_tokens1024-v1" \
+  --operator-attested-candidate \
   --json-out benchmark-report.json
 ```
 
@@ -39,14 +40,59 @@ the report records the manifest checkpoint ID and manifest SHA-256. `--publish`
 is an explicit publish-report intent flag and additionally requires
 `--checkpoint` and `--json-out`; it does not upload or sign anything.
 
-The strict report also binds the **raw bytes** of the case JSONL by SHA-256,
-records the supplied generation-settings identifier, and hashes the external
-candidate JSONL. These provenance values make later comparison/review
-repeatable, but they do not prove that the candidate outputs came from that
-checkpoint or used those settings. The checkpoint/output association and
-settings identifier are operator self-attestations: the evaluator never loads
-a model, runs inference, generates responses, signs reports, or verifies a
-generation server's logs.
+Unmarked external candidates are accepted in strict mode only when
+`--operator-attested-candidate` is explicitly supplied. The strict report binds
+the raw case bytes and candidate bytes, but the checkpoint/output association
+and settings identifier for this mode are operator self-attestations.
+
+### Local Transformers generation flow
+
+When held-out cases and a verified local checkpoint are available, generate
+the complete candidate file before running the strict evaluator:
+
+```bash
+python -m evals.generate \
+  --cases held-out-cases.jsonl \
+  --checkpoint 0123456789abcdef01234567 \
+  --registry training/checkpoints/registry.json \
+  --output fomo-responses.jsonl \
+  --max-new-tokens 1024
+
+python -m evals \
+  --cases held-out-cases.jsonl \
+  --candidate fomo-responses.jsonl \
+  --checkpoint 0123456789abcdef01234567 \
+  --registry training/checkpoints/registry.json \
+  --generation-settings-id "COPY-THE-EXACT-ID-PRINTED-BY-GENERATOR" \
+  --json-out benchmark-report.json
+```
+
+`python -m evals.generate` uses only `fomo.brain.model.LocalTransformersBackend`;
+it does not select a fallback model. The backend verifies the local checkpoint
+manifest and artifacts before inference. Generation is greedy (`temperature=0`,
+`do_sample=false`). Each response line binds the response to the raw case-file
+SHA-256, that case's prompt SHA-256, verified checkpoint ID and manifest
+SHA-256, plus the complete generation settings and a deterministic settings ID.
+The generator prints that exact settings ID; pass it unchanged to strict
+evaluation. Strict evaluation rejects a generated candidate when any bound case
+file, prompt, checkpoint manifest, or settings ID differs, and fails closed on
+partial or malformed provenance. Candidate-byte hashes are also included in
+the report.
+
+The generated metadata is validated but not signed: strict evaluation cannot
+prove that someone actually ran inference on that checkpoint. Its binding means
+the recorded hashes/settings agree with the current inputs, not cryptographic
+proof of the response's origin. Generated candidates do not use
+`--operator-attested-candidate`; that flag is reserved for unmarked external
+candidate files, whose limitations remain explicit in the report. Generation
+preserves case IDs and order, rejects existing output unless `--overwrite` is
+specified, and writes atomically only after all generations succeed. It accepts
+at most 10,000 cases, a 100 MiB case file, and 100,000 characters per prompt.
+
+The command flow is ready for a real GPU checkpoint and genuinely held-out
+cases. Unit tests use an injected fake backend solely to exercise file handling
+and failure behavior; those fixtures are not inference results or benchmark
+evidence.
 
 The default mode remains `offline_label_check`. It remains compatible with
 case-embedded responses and optional candidate files, and reports explicitly
