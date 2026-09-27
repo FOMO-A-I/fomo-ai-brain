@@ -64,7 +64,3 @@ Supervised fine-tuning (SFT) requires instruction/ideal-response pairs and a lic
 The local Transformers backend does not provide continuous batching, KV-cache scheduling, distributed inference, GPU autoscaling, moderation, or a verified jailbreak defense. A production deployment needs an optimized serving engine, real isolation and policy enforcement, operational monitoring and a security review. The `infrastructure/` directory provides building blocks, **not a pre-deployed cluster**.
 
 The `LICENSE` file currently reserves rights; public visibility alone does not grant reuse permission. The repository owner can replace it with an explicit license of their choice.
-
-### Български
-
-Кодът е основа за собствен FOMO checkpoint и бъдещ сайт, но **моделът още не е обучен**. Не са качени данни, оценки от хора или тежести на модел. Системата не се преструва, че Qwen е FOMO: без зададен реален checkpoint отказва inference. Обучението и измерването на качеството трябва да се изпълнят с действителни данни и GPU ресурси.
