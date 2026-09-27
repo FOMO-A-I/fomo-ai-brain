@@ -6,7 +6,7 @@ GPUs, provision a production database, deploy a model, or train a checkpoint.
 - `docker/Dockerfile` builds a CPU development image. Replace its PyTorch wheel
   with a CUDA-compatible one when preparing a GPU image.
 - `gpu/launch.py` validates the actual checkpoint and CUDA availability before
-  starting the API process. Its checks fail rather than falling back to Qwen.
+  starting the API process. Its checks fail rather than loading an unrelated model.
 - `workers/router.py` is a bounded HTTP worker pool for configured inference
   backends; use only trusted endpoints on a private network.
 - `postgres/schema.sql` documents the server-side storage and ownership schema
