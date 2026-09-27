@@ -61,4 +61,3 @@ See [.env.example](.env.example) for configuration names.
 
 FOMO token contract address (CA): `ExWPmvNCXPbkQG8qXe9Ddjhgi53UvLCu2pn1akzGpump`
 
-Token information is separate from the FOMO Brain engineering roadmap. Token checkout is not live.
