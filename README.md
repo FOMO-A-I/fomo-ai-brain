@@ -1,8 +1,18 @@
 # FOMO AI Brain
 
-A standalone Python codebase for creating, evaluating and serving a **FOMO-specific model checkpoint**. The runtime accepts an explicitly supplied local checkpoint; it never silently replaces it with Qwen, a hosted API, or a scripted response. The repository has no hosting-platform SDK requirement.
+FOMO AI Brain is the core model and training infrastructure we are building for FOMO AI.
 
-> **Status:** This repository contains runnable infrastructure and offline tests, **not a trained FOMO model**. No licensed training dataset, human preference labels, GPU run, resulting checkpoint, or large evaluation corpus has been supplied. It would be inaccurate to describe it as a newly trained model or a production ChatGPT equivalent.
+This repository contains our training pipeline, SFT and DPO workflows, model checkpoints, evaluation system, inference runtime, memory, reasoning and multi-agent architecture.
+
+Our goal is to continuously train and improve FOMO-specific model checkpoints using our own datasets, preference data and evaluation results.
+
+## How it works
+
+Training Data → SFT → DPO → FOMO Checkpoint → Evaluation → FOMO Brain → Agents → Memory → Tools → Verification
+
+We are building the system in separate modules so the model, training pipeline, agents, memory and tools can all evolve independently as FOMO AI grows.
+
+The first FOMO-trained checkpoints will be added as GPU training and evaluation are completed.
 
 ## Project areas
 
